@@ -414,14 +414,11 @@ impl FffPicker {
                                 grep_order.push(path.clone());
                                 grep_fi_index.insert(path.clone(), gm.file_index);
                             }
-                            grep_by_path
-                                .entry(path)
-                                .or_default()
-                                .push(GrepMatchLine {
-                                    line_number: gm.line_number,
-                                    line_content: gm.line_content.clone(),
-                                    byte_ranges: gm.match_byte_offsets.iter().copied().collect(),
-                                });
+                            grep_by_path.entry(path).or_default().push(GrepMatchLine {
+                                line_number: gm.line_number,
+                                line_content: gm.line_content.clone(),
+                                byte_ranges: gm.match_byte_offsets.iter().copied().collect(),
+                            });
                         }
 
                         // content_only (query has spaces / punctuation): show only grep hits.
@@ -955,7 +952,7 @@ impl Render for FffPicker {
                         div()
                             .text_color(rgb(theme::MATCH_HIGHLIGHT))
                             .text_sm()
-                            .child("fff"),
+                            .child("🪿"),
                     )
                     .child(self.text_field.clone()),
                     )
