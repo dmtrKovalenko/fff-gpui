@@ -1,0 +1,18 @@
+// Project tasks configuration. See https://zed.dev/docs/tasks for documentation.
+//
+// Example:
+[
+  {
+    "label": "Build and run fff-gpui",
+    "command": "cargo build --release && ./target/release/fff-gpui /Users/thomas",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "never",
+    "reveal_target": "dock",
+    "hide": "on_success",
+    "shell": "system",
+    "show_summary": false,
+    "show_command": false,
+    "save": "all",
+  },
+]

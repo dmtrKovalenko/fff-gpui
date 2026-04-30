@@ -1,0 +1,10 @@
+pub const BG: u32 = 0x1C1C1E;
+pub const BORDER: u32 = 0x2F2F31;
+pub const SELECTED_ROW: u32 = 0x2C3F59;
+pub const HOVER_ROW: u32 = 0x2A2A2C;
+pub const TEXT_PRIMARY: u32 = 0xFFFFFF;
+pub const TEXT_SECONDARY: u32 = 0x8E8E93;
+pub const TEXT_DIM: u32 = 0x6C6C70;
+pub const STATUS_BAR_BG: u32 = 0x18181A;
+pub const MATCH_HIGHLIGHT: u32 = 0x4A9EFF;
+pub const PREVIEW_BG: u32 = 0x161618;
