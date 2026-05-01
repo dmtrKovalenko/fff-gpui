@@ -42,7 +42,9 @@ This is the recommended way to use fff-gpui. Add the following to your Zed confi
 {
   "context": "Workspace",
   "bindings": {
-    "cmd-k cmd-f": ["task::Spawn", { "task_name": "Open fff-gpui" }]
+    "cmd-p": [
+      "task::Spawn", 
+      { "task_name": "Open fff-gpui" }]
   }
 }
 ```
@@ -56,6 +58,17 @@ This opens fff-gpui scoped to the current project root. Selected files open dire
 - Latest stable Rust via [rustup](https://rustup.rs)
 - Xcode Command Line Tools (`xcode-select --install`)
 - CMake ([required by wasmtime](https://docs.rs/wasmtime-c-api-impl/latest/wasmtime_c_api/))
+- Zig 0.16.0 ([required by zlob](https://crates.io/crates/zlob))
+
+To compile without Zig, disable zlob in the `Cargo.toml`. This will lead to slightly slower performance, but it's not required for the app to work.
+
+```toml
++ fff-search = "0.6"
++ fff-query-parser = "0.6"
+- fff-search = { version = "0.6", features = ["zlob"] }
+- fff-query-parser = { version = "0.6", features = ["zlob"] }
+```
+
 
 **Build:**
 ```sh
