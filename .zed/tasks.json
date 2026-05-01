@@ -4,7 +4,7 @@
 [
   {
     "label": "Build and run fff-gpui",
-    "command": "cargo build --release && ./target/release/fff-gpui /Users/thomas",
+    "command": "cargo build --release && ./target/release/fff-gpui -d",
     "use_new_terminal": false,
     "allow_concurrent_runs": false,
     "reveal": "never",

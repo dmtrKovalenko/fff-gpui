@@ -1,9 +1,15 @@
-use std::io::Write;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::sync::mpsc::{self, Sender};
 
-// Return the log path used for open failures and spawn traces.
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt;
+use tracing_subscriber::fmt::writer::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::prelude::*;
+
+// Return the log path used for file-backed tracing output.
 fn log_path() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -11,47 +17,47 @@ fn log_path() -> PathBuf {
         .join(".local/state/fff-gpui/fff-gpui.log")
 }
 
-// Append a message to stderr and the background log writer.
-pub fn append(message: impl AsRef<str>) {
-    let message = message.as_ref().to_string();
-    if sender().send(message.clone()).is_err() {
-        eprintln!("{message}");
+struct LogFileWriter;
+
+impl<'a> MakeWriter<'a> for LogFileWriter {
+    type Writer = Box<dyn Write + Send + 'static>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        let path = log_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        match OpenOptions::new().create(true).append(true).open(path) {
+            Ok(file) => Box::new(file),
+            Err(_) => Box::new(io::sink()),
+        }
     }
 }
 
-// Return the singleton channel feeding the log writer thread.
-fn sender() -> &'static Sender<String> {
-    static SENDER: OnceLock<Sender<String>> = OnceLock::new();
-    SENDER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<String>();
-        std::thread::Builder::new()
-            .name("fff-gpui-log".to_string())
-            .spawn(move || {
-                while let Ok(message) = rx.recv() {
-                    write_message(&message);
-                }
-            })
-            .expect("failed to spawn fff-gpui log writer");
-        tx
-    })
-}
+// Initialize tracing for stderr and the persistent log file.
+pub fn init_tracing() {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-// Write a single log message to stderr and disk.
-fn write_message(message: &str) {
-    eprintln!("{message}");
+    let stderr_layer = fmt::layer()
+        .with_ansi(true)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_filter(env_filter);
 
-    let path = log_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let file_layer = fmt::layer()
+        .with_ansi(true)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_writer(LogFileWriter)
+        .with_filter(LevelFilter::TRACE);
 
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{message}");
-    }
+    tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(file_layer)
+        .init();
 }
 
 // Return the log path as display text for user-facing errors.

@@ -60,6 +60,15 @@ impl TextField {
         self.content.to_string()
     }
 
+    // Replace the current text content and reset the selection.
+    pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.content = text.into();
+        self.selected_range = self.content.len()..self.content.len();
+        self.selection_reversed = false;
+        self.marked_range = None;
+        cx.notify();
+    }
+
     // Move the cursor or selection to the left.
     fn left(&mut self, _: &FieldLeft, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
@@ -590,9 +599,7 @@ impl Element for TextFieldElement {
 
 impl Render for TextField {
     // Render the text field shell.
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let focused = self.focus_handle(cx).is_focused(window);
-
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .key_context("FffTextField")
             .track_focus(&self.focus_handle(cx))
@@ -620,11 +627,7 @@ impl Render for TextField {
             .items_center()
             .bg(rgb(0x232326))
             .border_1()
-            .border_color(if focused {
-                rgb(0x0A84FF)
-            } else {
-                rgb(0x2F2F31)
-            })
+            .border_color(rgb(0x2F2F31))
             .rounded(px(6.0))
             .line_height(px(18.0))
             .text_size(px(14.0))

@@ -1,21 +1,39 @@
+#![allow(unexpected_cfgs)]
+
+mod config;
 mod editor;
+mod hotkey;
 mod log;
+mod login_item;
+mod menubar;
 mod path_shortening;
 mod picker;
 mod preview;
+mod service;
 mod text_field;
 mod theme;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use global_hotkey::GlobalHotKeyManager;
 use gpui::prelude::*;
 use gpui::*;
+use tracing::{debug, info};
 
-use picker::{FffPicker, OpenSelected, Quit, SelectNext, SelectPrev};
+use config::AppConfig;
+use picker::{
+    CyclePreviousQuery, FffPicker, OpenSelected, PickerSharedState, PreviewScrollDown,
+    PreviewScrollUp, Quit, SelectNext, SelectPrev, SwitchFiles, SwitchGrep,
+};
+use service::{ServiceCommand, forward_to_running_instance, start_listener};
 use text_field::{
     FieldBackspace, FieldCopy, FieldCut, FieldDelete, FieldEnd, FieldHome, FieldLeft, FieldPaste,
     FieldRight, FieldSelectAll, FieldSelectLeft, FieldSelectRight,
 };
+
+actions!(fff_gpui, [ToggleWindow, OpenConfig]);
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -23,23 +41,114 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const WINDOW_WIDTH: f32 = 960.0;
 const WINDOW_HEIGHT: f32 = 520.0;
 
-// Resolve the base directory from argv[1] or the current working directory.
-fn resolve_base_path() -> PathBuf {
-    std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+#[derive(Debug, Clone)]
+struct LaunchOptions {
+    base_path: PathBuf,
+    background: bool,
+    open_path: Option<PathBuf>,
+    base_path_explicit: bool,
 }
 
-// Register key bindings for the picker and text field actions.
-fn bind_keys(cx: &mut App) {
+#[derive(Clone)]
+struct PickerSession {
+    base_path: PathBuf,
+    shared: PickerSharedState,
+    enable_content_indexing: bool,
+}
+
+struct RuntimeConfig {
+    config: AppConfig,
+    config_path: PathBuf,
+    hotkey_manager: Option<GlobalHotKeyManager>,
+    registered_hotkey: Option<global_hotkey::hotkey::HotKey>,
+}
+
+impl PickerSession {
+    fn new(base_path: PathBuf, enable_content_indexing: bool) -> Self {
+        Self {
+            base_path,
+            shared: PickerSharedState::default(),
+            enable_content_indexing,
+        }
+    }
+}
+
+// Resolve the user's home directory on Unix.
+#[cfg(unix)]
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn normalize_dir(path: PathBuf) -> Option<PathBuf> {
+    path.is_dir()
+        .then(|| std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+// Resolve the base directory from argv[1] or the user's home directory.
+fn parse_launch_options() -> LaunchOptions {
+    let mut background = false;
+    let mut base_path = None;
+    let mut open_path = None;
+    let mut args = std::env::args().skip(1);
+
+    while let Some(arg) = args.next() {
+        if arg == "-d" || arg == "--daemon" {
+            background = true;
+            continue;
+        }
+
+        if arg == "--open" {
+            if let Some(path) = args.next().map(PathBuf::from).and_then(normalize_dir) {
+                open_path = Some(path);
+            }
+            continue;
+        }
+
+        if base_path.is_none() {
+            if let Some(path) = normalize_dir(PathBuf::from(arg)) {
+                base_path = Some(path);
+            }
+        }
+    }
+
+    LaunchOptions {
+        base_path: base_path.clone().unwrap_or_else(home_dir),
+        background,
+        open_path,
+        base_path_explicit: base_path.is_some(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn make_dockless() {
+    use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicyAccessory};
+
+    unsafe {
+        let app = NSApp();
+        app.setActivationPolicy_(NSApplicationActivationPolicyAccessory);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn make_dockless() {}
+
+// Register the built-in key bindings for the picker and text field actions.
+fn bind_base_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("escape", Quit, None),
         KeyBinding::new("enter", OpenSelected, None),
         KeyBinding::new("return", OpenSelected, None),
         KeyBinding::new("up", SelectPrev, None),
         KeyBinding::new("down", SelectNext, None),
+        KeyBinding::new("tab", SelectNext, None),
+        KeyBinding::new("shift-tab", SelectPrev, None),
+        KeyBinding::new("ctrl-up", CyclePreviousQuery, None),
+        KeyBinding::new("ctrl-u", PreviewScrollUp, None),
+        KeyBinding::new("ctrl-d", PreviewScrollDown, None),
+        KeyBinding::new("ctrl-f", SwitchFiles, None),
+        KeyBinding::new("ctrl-g", SwitchGrep, None),
         KeyBinding::new("backspace", FieldBackspace, None),
         KeyBinding::new("delete", FieldDelete, None),
         KeyBinding::new("left", FieldLeft, None),
@@ -55,8 +164,104 @@ fn bind_keys(cx: &mut App) {
     ]);
 }
 
+fn bind_runtime_keys(cx: &mut App, config: &AppConfig) {
+    if let Some(binding) = config.global_keybind.as_deref()
+        && let Ok(Some(_)) = hotkey::parse_hotkey(Some(binding))
+    {
+        cx.bind_keys([KeyBinding::new(binding, ToggleWindow, None)]);
+    }
+}
+
+fn apply_key_bindings(cx: &mut App, config: &AppConfig, replace: bool) -> bool {
+    match hotkey::parse_hotkey(config.global_keybind.as_deref()) {
+        Ok(_) => {
+            if replace {
+                cx.clear_key_bindings();
+            }
+            bind_base_keys(cx);
+            bind_runtime_keys(cx, config);
+            true
+        }
+        Err(err) => {
+            if !replace {
+                cx.clear_key_bindings();
+                bind_base_keys(cx);
+            }
+            info!(error = %err, "skipping global hotkey binding");
+            false
+        }
+    }
+}
+
+fn register_global_hotkey(state: &mut RuntimeConfig, config: &AppConfig) {
+    let Ok(Some(hotkey)) = hotkey::parse_hotkey(config.global_keybind.as_deref()) else {
+        if let Some(manager) = &state.hotkey_manager
+            && let Some(existing) = state.registered_hotkey.take()
+        {
+            let _ = manager.unregister(existing);
+        }
+        return;
+    };
+
+    if state.hotkey_manager.is_none() {
+        state.hotkey_manager = GlobalHotKeyManager::new().ok();
+    }
+
+    let Some(manager) = &state.hotkey_manager else {
+        info!("global hotkey manager unavailable");
+        return;
+    };
+
+    if state.registered_hotkey == Some(hotkey) {
+        return;
+    }
+
+    let previous = state.registered_hotkey.take();
+    if let Some(existing) = previous {
+        let _ = manager.unregister(existing);
+    }
+
+    match manager.register(hotkey) {
+        Ok(_) => {
+            state.registered_hotkey = Some(hotkey);
+            info!(hotkey = %hotkey, "registered global toggle hotkey");
+        }
+        Err(err) => {
+            if let Some(existing) = previous {
+                let _ = manager.register(existing);
+                state.registered_hotkey = Some(existing);
+            }
+            info!(error = %err, hotkey = %hotkey, "failed to register global hotkey");
+        }
+    }
+}
+
+fn open_config_file(runtime: &Arc<Mutex<RuntimeConfig>>) {
+    let (path, config) = match runtime.lock() {
+        Ok(state) => (state.config_path.clone(), state.config.clone()),
+        Err(_) => (config::active_config_path(), AppConfig::default()),
+    };
+
+    if let Err(err) = config::ensure_config_file(&path, &config) {
+        info!(error = %err, path = %path.display(), "failed to ensure config file");
+        return;
+    }
+
+    match editor::open_in_editor(&path, None) {
+        Ok(child) => {
+            info!(pid = child.id(), path = %path.display(), "opened config file");
+        }
+        Err(err) => {
+            info!(error = %err, path = %path.display(), "failed to open config file");
+        }
+    }
+}
+
 // Open the main picker window centered on the primary display.
-fn open_window(base_path: PathBuf, cx: &mut App) {
+fn open_window(session: PickerSession, cx: &mut App) {
+    let base_path = session.base_path;
+    let shared = session.shared;
+    let enable_content_indexing = session.enable_content_indexing;
     let bounds = cx
         .primary_display()
         .map(|d| {
@@ -76,17 +281,23 @@ fn open_window(base_path: PathBuf, cx: &mut App) {
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: None,
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(8.0), px(8.0))),
-                ..Default::default()
-            }),
+            titlebar: None,
             is_resizable: false,
+            kind: WindowKind::PopUp,
             ..WindowOptions::default()
         },
         |window, cx| {
-            let view = cx.new(|cx| FffPicker::new(base_path, cx));
+            let view = cx.new(|cx| {
+                FffPicker::new(
+                    base_path.clone(),
+                    shared.clone(),
+                    enable_content_indexing,
+                    cx,
+                )
+            });
+            view.update(cx, |picker, cx| {
+                picker.install_focus_lost_dismiss(window, cx);
+            });
             let focus = view.read(cx).text_field_focus_handle(cx);
             window.focus(&focus);
             view
@@ -95,14 +306,302 @@ fn open_window(base_path: PathBuf, cx: &mut App) {
     .expect("failed to open fff window");
 }
 
-// Launch the GPUI application.
-fn main() {
-    let base_path = resolve_base_path();
+fn close_all_windows(cx: &mut App) {
+    let windows = cx.windows();
+    for window in windows {
+        let _ = window.update(cx, |_, window, _| {
+            window.remove_window();
+        });
+    }
+}
 
-    Application::new().run(|cx: &mut App| {
-        cx.activate(true);
-        cx.on_action(|_: &Quit, cx| cx.quit());
-        bind_keys(cx);
-        open_window(base_path, cx);
+fn toggle_picker(session: &Arc<Mutex<PickerSession>>, cx: &mut App) {
+    if cx.windows().is_empty() {
+        let session = snapshot_session(session);
+        info!(base_path = %session.base_path.display(), "opening picker window");
+        open_window(session, cx);
+    } else {
+        info!("closing picker window(s)");
+        close_all_windows(cx);
+        return;
+    }
+}
+
+fn snapshot_session(session: &Arc<Mutex<PickerSession>>) -> PickerSession {
+    session
+        .lock()
+        .map(|session| session.clone())
+        .unwrap_or_else(|_| PickerSession::new(home_dir(), false))
+}
+
+fn one_shot_session(
+    path: PathBuf,
+    sessions: &Arc<Mutex<HashMap<PathBuf, PickerSession>>>,
+) -> PickerSession {
+    let fallback_path = path.clone();
+    sessions
+        .lock()
+        .map(|mut sessions| {
+            sessions
+                .entry(path.clone())
+                .or_insert_with(|| PickerSession::new(path, true))
+                .clone()
+        })
+        .unwrap_or_else(|_| PickerSession::new(fallback_path, true))
+}
+
+fn show_or_focus_picker(session: &Arc<Mutex<PickerSession>>, cx: &mut App) {
+    if cx.windows().is_empty() {
+        let session = snapshot_session(session);
+        info!(base_path = %session.base_path.display(), "reopening picker window");
+        open_window(session, cx);
+    }
+}
+
+fn handle_service_command(
+    command: ServiceCommand,
+    session: &Arc<Mutex<PickerSession>>,
+    one_shot_sessions: &Arc<Mutex<HashMap<PathBuf, PickerSession>>>,
+    runtime_config: &Arc<Mutex<RuntimeConfig>>,
+    cx: &mut App,
+) {
+    match command {
+        ServiceCommand::ShowPicker => {
+            debug!("received show-picker service command");
+            show_or_focus_picker(session, cx)
+        }
+        ServiceCommand::ToggleWindow => {
+            debug!("received toggle-window service command");
+            toggle_picker(session, cx)
+        }
+        ServiceCommand::OpenPath(path) => {
+            debug!(path = %path.display(), "received open-path service command");
+            let (should_replace, session_snapshot) = match session.lock() {
+                Ok(mut current) => {
+                    let changed = current.base_path != path;
+                    if changed {
+                        *current = PickerSession::new(path.clone(), true);
+                    }
+                    (changed, current.clone())
+                }
+                Err(_) => (true, PickerSession::new(path.clone(), true)),
+            };
+
+            if cx.windows().is_empty() {
+                open_window(session_snapshot, cx);
+            } else if should_replace {
+                close_all_windows(cx);
+                open_window(session_snapshot, cx);
+            }
+        }
+        ServiceCommand::OpenOneShot(path) => {
+            debug!(path = %path.display(), "received one-shot open service command");
+            open_window(one_shot_session(path, one_shot_sessions), cx);
+        }
+        ServiceCommand::OpenConfig => {
+            debug!("received open-config service command");
+            open_config_file(runtime_config);
+        }
+        ServiceCommand::Quit => {
+            debug!("received quit service command");
+            cx.quit();
+        }
+    }
+}
+
+fn drive_service_commands(
+    rx: async_channel::Receiver<ServiceCommand>,
+    session: Arc<Mutex<PickerSession>>,
+    one_shot_sessions: Arc<Mutex<HashMap<PathBuf, PickerSession>>>,
+    runtime_config: Arc<Mutex<RuntimeConfig>>,
+    app: AsyncApp,
+) -> impl std::future::Future<Output = ()> {
+    async move {
+        while let Ok(command) = rx.recv().await {
+            let _ = app.update(|app| {
+                handle_service_command(command, &session, &one_shot_sessions, &runtime_config, app)
+            });
+        }
+    }
+}
+
+fn reload_runtime_config(runtime_config: &Arc<Mutex<RuntimeConfig>>, cx: &mut App) {
+    let loaded = {
+        let path = match runtime_config.lock() {
+            Ok(state) => state.config_path.clone(),
+            Err(_) => return,
+        };
+
+        match config::load_config_from(&path) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                info!(error = %err, path = %path.display(), "failed to reload config");
+                return;
+            }
+        }
+    };
+
+    if !apply_key_bindings(cx, &loaded.config, true) {
+        return;
+    }
+
+    let mut state = match runtime_config.lock() {
+        Ok(state) => state,
+        Err(_) => return,
+    };
+
+    let previous_launch_at_login = state.config.launch_at_login;
+    state.config = loaded.config.clone();
+    state.config_path = loaded.path.clone();
+    let config = state.config.clone();
+    register_global_hotkey(&mut state, &config);
+    login_item::sync_launch_at_login(state.config.launch_at_login);
+
+    if previous_launch_at_login != state.config.launch_at_login {
+        info!(
+            launch_at_login = state.config.launch_at_login,
+            "updated launch-at-login preference"
+        );
+    }
+}
+
+// Launch the resident GPUI service.
+fn main() {
+    log::init_tracing();
+
+    let launch = parse_launch_options();
+    let base_path = launch.base_path.clone();
+    let picker_session = Arc::new(Mutex::new(PickerSession::new(
+        base_path.clone(),
+        launch.base_path_explicit,
+    )));
+    let one_shot_sessions = Arc::new(Mutex::new(HashMap::new()));
+    let loaded_config = match config::load_active_config() {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            info!(error = %err, "failed to load config; falling back to defaults");
+            config::LoadedConfig {
+                path: config::active_config_path(),
+                config: AppConfig::default(),
+            }
+        }
+    };
+    let runtime_config = Arc::new(Mutex::new(RuntimeConfig {
+        config: loaded_config.config.clone(),
+        config_path: loaded_config.path.clone(),
+        hotkey_manager: None,
+        registered_hotkey: None,
+    }));
+    let shell = std::env::var("SHELL").ok();
+    let home = std::env::var("HOME").ok();
+    let editor = std::env::var("EDITOR").ok();
+    let visual = std::env::var("VISUAL").ok();
+    let path_env = std::env::var("PATH").ok();
+    let cwd = std::env::current_dir().ok();
+
+    info!(
+        base_path = %base_path.display(),
+        background = launch.background,
+        config_path = %loaded_config.path.display(),
+        global_keybind = ?loaded_config.config.global_keybind,
+        "starting fff-gpui"
+    );
+    debug!(
+        shell = ?shell,
+        home = ?home,
+        editor = ?editor,
+        visual = ?visual,
+        path_env = ?path_env,
+        cwd = ?cwd,
+        "startup environment"
+    );
+
+    let forward_command = launch
+        .open_path
+        .clone()
+        .map(ServiceCommand::OpenOneShot)
+        .unwrap_or_else(|| ServiceCommand::OpenPath(base_path.clone()));
+
+    if forward_to_running_instance(&forward_command)
+        .expect("failed to forward launch request to existing service")
+    {
+        info!(?forward_command, "forwarded launch to running instance");
+        return;
+    }
+
+    let (service_tx, service_rx) = async_channel::unbounded::<ServiceCommand>();
+    start_listener(service_tx.clone()).expect("failed to start launch request listener");
+    info!("resident service listener started");
+
+    let app = Application::new();
+    let reopen_session = picker_session.clone();
+    app.on_reopen(move |cx| show_or_focus_picker(&reopen_session, cx));
+
+    app.run(move |cx: &mut App| {
+        make_dockless();
+        hotkey::install_event_handler(service_tx.clone());
+        if let Ok(state) = runtime_config.lock() {
+            let _ = apply_key_bindings(cx, &state.config, false);
+        }
+        cx.on_action({
+            let picker_session = picker_session.clone();
+            move |_: &ToggleWindow, cx| toggle_picker(&picker_session, cx)
+        });
+        {
+            let runtime_config = runtime_config.clone();
+            cx.on_action(move |_: &OpenConfig, _cx| {
+                info!("config action invoked");
+                open_config_file(&runtime_config);
+            });
+        }
+        cx.spawn({
+            let runtime_config = runtime_config.clone();
+            async move |cx: &mut AsyncApp| {
+                let _ = cx.update(|_app| {
+                    if let Ok(mut state) = runtime_config.lock() {
+                        let config = state.config.clone();
+                        register_global_hotkey(&mut state, &config);
+                    }
+                });
+            }
+        })
+        .detach();
+        if let Some(path) = launch.open_path.clone() {
+            open_window(one_shot_session(path, &one_shot_sessions), cx);
+        } else {
+            info!("launching without initial picker window");
+        }
+        menubar::install(service_tx.clone());
+
+        let (config_tx, config_rx) = async_channel::unbounded::<()>();
+        let config_path = runtime_config
+            .lock()
+            .map(|state| state.config_path.clone())
+            .unwrap_or_else(|_| config::active_config_path());
+        let _config_watcher = config::watch_config_path(config_path, config_tx.clone())
+            .expect("failed to start config watcher");
+
+        cx.spawn({
+            let runtime_config = runtime_config.clone();
+            async move |cx: &mut AsyncApp| {
+                while config_rx.recv().await.is_ok() {
+                    let _ = cx.update(|app| {
+                        reload_runtime_config(&runtime_config, app);
+                    });
+                }
+            }
+        })
+        .detach();
+
+        cx.spawn(move |cx: &mut AsyncApp| {
+            drive_service_commands(
+                service_rx,
+                picker_session.clone(),
+                one_shot_sessions.clone(),
+                runtime_config.clone(),
+                cx.clone(),
+            )
+        })
+        .detach();
     });
 }

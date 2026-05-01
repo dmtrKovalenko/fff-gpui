@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{
@@ -6,14 +7,16 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use fff_query_parser::{FileSearchConfig, QueryParser};
 use fff_search::{
-    FFFMode, FilePickerOptions, FileSearchConfig, FuzzySearchOptions, GrepMode, GrepSearchOptions,
-    PaginationArgs, QueryParser, SharedFrecency, SharedPicker, SharedQueryTracker,
-    file_picker::FilePicker, frecency::FrecencyTracker, grep::parse_grep_query,
+    FFFMode, FilePickerOptions, FuzzySearchOptions, GrepMode, GrepSearchOptions, PaginationArgs,
+    SharedFrecency, SharedPicker, SharedQueryTracker, file_picker::FilePicker,
+    frecency::FrecencyTracker, git::format_git_status_opt, grep::has_regex_metacharacters,
     query_tracker::QueryTracker,
 };
 use gpui::prelude::*;
 use gpui::*;
+use tracing::{debug, error, info, trace, warn};
 
 use crate::editor;
 use crate::log;
@@ -22,7 +25,35 @@ use crate::preview::{self, HighlightedLine};
 use crate::text_field::TextField;
 use crate::theme;
 
-actions!(fff_picker, [Quit, OpenSelected, SelectNext, SelectPrev]);
+actions!(
+    fff_picker,
+    [
+        Quit,
+        OpenSelected,
+        SelectNext,
+        SelectPrev,
+        ToggleSelected,
+        CycleGrepMode,
+        CyclePreviousQuery,
+        PreviewScrollUp,
+        PreviewScrollDown,
+        SwitchFiles,
+        SwitchGrep,
+    ]
+);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchView {
+    Files,
+    Grep,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PickerSharedState {
+    pub shared_picker: SharedPicker,
+    pub shared_frecency: SharedFrecency,
+    pub shared_query_tracker: SharedQueryTracker,
+}
 
 // Return a sensible worker count for fff searches on the current machine.
 fn search_threads() -> usize {
@@ -45,6 +76,7 @@ pub struct FileItemSnapshot {
     pub file_name: String,
     pub dir: String,
     pub absolute_path: PathBuf,
+    pub git_status: Option<String>,
     pub match_ranges: Vec<Range<usize>>,
     pub grep_matches: Vec<GrepMatchLine>,
 }
@@ -53,23 +85,31 @@ pub struct FffPicker {
     shared_picker: SharedPicker,
     shared_frecency: SharedFrecency,
     shared_query_tracker: SharedQueryTracker,
+    view: SearchView,
+    grep_mode: GrepMode,
     query: String,
     results: Vec<FileItemSnapshot>,
     total_files: usize,
     total_matched: usize,
     selected: usize,
+    selected_paths: BTreeSet<PathBuf>,
     scan_done: bool,
     search_epoch: u64,
     search_in_flight: bool,
     search_queued: bool,
     search_abort: Option<Arc<AtomicBool>>,
     preview_epoch: u64,
+    preview_loading: bool,
+    preview_loading_visible: bool,
+    preview_scroll_row: usize,
     focus_handle: FocusHandle,
     list_scroll: UniformListScrollHandle,
     preview_scroll: UniformListScrollHandle,
     preview_lines: Vec<HighlightedLine>,
     status_message: Option<String>,
     text_field: Entity<TextField>,
+    dismiss_on_blur: Option<Subscription>,
+    dismiss_on_window_blur: Option<Subscription>,
 }
 
 // Find byte ranges where query characters appear in order.
@@ -186,7 +226,8 @@ fn shorten_dir_for_row(dir: &str, max_chars: usize) -> String {
 // Allow fuzzy fallback only for simple identifier-like queries.
 //
 // Code-shaped queries with spaces or punctuation should stay literal so
-// `struct Data {` doesn't degrade into a partial match on `struct`.
+// `struct Data {` continues to search file contents instead of collapsing
+// into a weak filename-only fuzzy match.
 fn should_allow_fuzzy_fallback(query: &str) -> bool {
     let query = query.trim();
     if query.is_empty() || query.chars().any(char::is_whitespace) {
@@ -198,58 +239,245 @@ fn should_allow_fuzzy_fallback(query: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
+// Format a git status badge for a row.
+fn git_status_badge(status: Option<&str>) -> Option<(&'static str, u32)> {
+    match status {
+        Some("modified") => Some(("M", 0xF5A524)),
+        Some("staged_new") | Some("staged_modified") => Some(("A", 0x32D583)),
+        Some("staged_deleted") | Some("deleted") => Some(("D", 0xF97066)),
+        Some("renamed") => Some(("R", 0x8E8E93)),
+        Some("untracked") => Some(("?", 0xA48EFF)),
+        Some("ignored") => Some(("I", 0x6C6C70)),
+        Some("clean") | None => None,
+        Some(_) => Some(("?", 0x6C6C70)),
+    }
+}
+
+// Run a live grep query using the upstream parser and grep engine.
+fn execute_grep_search(
+    picker: &FilePicker,
+    query: &str,
+    base: &PathBuf,
+    abort_signal: Arc<AtomicBool>,
+    grep_mode: GrepMode,
+) -> (Vec<FileItemSnapshot>, usize, usize) {
+    let parsed = fff_search::grep::parse_grep_query(query);
+    let primary_mode = match grep_mode {
+        GrepMode::PlainText => {
+            if has_regex_metacharacters(query) {
+                GrepMode::Regex
+            } else {
+                GrepMode::PlainText
+            }
+        }
+        GrepMode::Regex => GrepMode::Regex,
+        GrepMode::Fuzzy => GrepMode::Fuzzy,
+    };
+
+    let run = |mode| {
+        picker.grep(
+            &parsed,
+            &GrepSearchOptions {
+                mode,
+                page_limit: 200,
+                max_matches_per_file: 5,
+                smart_case: true,
+                abort_signal: Some(abort_signal.clone()),
+                ..Default::default()
+            },
+        )
+    };
+
+    let mut grep_result = run(primary_mode);
+    if grep_result.matches.is_empty() && primary_mode == GrepMode::PlainText {
+        grep_result = run(GrepMode::Fuzzy);
+    }
+
+    let mut items: Vec<FileItemSnapshot> = Vec::new();
+    let mut item_by_path = std::collections::HashMap::<PathBuf, usize>::new();
+    for gm in &grep_result.matches {
+        let Some(fi) = grep_result.files.get(gm.file_index) else {
+            continue;
+        };
+        if fi.is_binary() {
+            continue;
+        }
+        let absolute_path = fi.absolute_path(picker, base);
+        let file_name = fi.file_name(picker);
+        let dir = fi.dir_str(picker);
+        let grep_match = GrepMatchLine {
+            line_number: gm.line_number,
+            line_content: gm.line_content.clone(),
+            byte_ranges: gm.match_byte_offsets.iter().copied().collect(),
+        };
+        if let Some(&idx) = item_by_path.get(&absolute_path) {
+            items[idx].grep_matches.push(grep_match);
+        } else {
+            item_by_path.insert(absolute_path.clone(), items.len());
+            items.push(FileItemSnapshot {
+                git_status: format_git_status_opt(fi.git_status).map(str::to_string),
+                match_ranges: find_match_ranges(query, &file_name),
+                file_name,
+                dir,
+                absolute_path,
+                grep_matches: vec![grep_match],
+            });
+        }
+    }
+
+    let total_files_seen = grep_result.total_files.max(grep_result.filtered_file_count);
+    let total_matched = items.len();
+    (items, total_files_seen, total_matched)
+}
+
 impl FffPicker {
     // Create a new picker rooted at `base_path` and start the background file scan.
-    pub fn new(base_path: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        base_path: PathBuf,
+        shared: PickerSharedState,
+        enable_content_indexing: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let text_field = cx.new(|cx| TextField::new("Search files...", cx));
 
         cx.observe(&text_field, |this, _entity, cx| {
             let new_query = this.text_field.read(cx).text();
             if new_query != this.query {
                 this.query = new_query;
+                this.status_message = None;
+                this.selected_paths.clear();
+                this.preview_scroll_row = 0;
                 this.run_search(cx);
             }
         })
         .detach();
 
         let mut instance = Self {
-            shared_picker: SharedPicker::default(),
-            shared_frecency: SharedFrecency::default(),
-            shared_query_tracker: SharedQueryTracker::default(),
+            shared_picker: shared.shared_picker,
+            shared_frecency: shared.shared_frecency,
+            shared_query_tracker: shared.shared_query_tracker,
+            view: SearchView::Files,
+            grep_mode: GrepMode::Fuzzy,
             query: String::new(),
             results: Vec::new(),
             total_files: 0,
             total_matched: 0,
             selected: 0,
+            selected_paths: BTreeSet::new(),
             scan_done: false,
             search_epoch: 0,
             search_in_flight: false,
             search_queued: false,
             search_abort: None,
             preview_epoch: 0,
+            preview_loading: false,
+            preview_loading_visible: false,
+            preview_scroll_row: 0,
             focus_handle: cx.focus_handle(),
             list_scroll: UniformListScrollHandle::new(),
             preview_scroll: UniformListScrollHandle::new(),
             preview_lines: Vec::new(),
             status_message: None,
             text_field,
+            dismiss_on_blur: None,
+            dismiss_on_window_blur: None,
         };
 
-        instance.start_scan(base_path, cx);
+        instance.start_scan(base_path, enable_content_indexing, cx);
         instance
     }
 
+    // Close the popup when the window loses focus, matching Raycast-style dismissal.
+    pub fn install_focus_lost_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus_handle = self.focus_handle.clone();
+        self.dismiss_on_blur =
+            Some(
+                cx.on_focus_out(&focus_handle, window, |_, _event, window, _cx| {
+                    window.remove_window();
+                }),
+            );
+        self.dismiss_on_window_blur = Some(cx.on_focus_lost(window, |_, window, _cx| {
+            window.remove_window();
+        }));
+    }
+
     // Start the file indexer and trigger the initial search when indexing is ready.
-    fn start_scan(&mut self, base_path: PathBuf, cx: &mut Context<Self>) {
+    #[tracing::instrument(skip(self, cx, base_path), fields(base_path = %base_path.display(), enable_content_indexing))]
+    fn start_scan(
+        &mut self,
+        base_path: PathBuf,
+        enable_content_indexing: bool,
+        cx: &mut Context<Self>,
+    ) {
         let sp = self.shared_picker.clone();
         let sf = self.shared_frecency.clone();
         let sq = self.shared_query_tracker.clone();
+        let existing_picker = self.shared_picker.read().ok().and_then(|guard| {
+            guard.as_ref().map(|picker| {
+                (
+                    picker.base_path().to_path_buf(),
+                    picker.is_scanning.load(Ordering::Acquire),
+                )
+            })
+        });
+
+        if let Some((existing_base_path, is_scanning)) = existing_picker
+            && existing_base_path == base_path
+        {
+            info!(
+                base_path = %base_path.display(),
+                is_scanning,
+                "reusing resident file index"
+            );
+            if is_scanning {
+                cx.spawn(
+                    async move |this: WeakEntity<FffPicker>, cx: &mut AsyncApp| {
+                        let scan_done =
+                            smol::unblock(move || sp.wait_for_scan(Duration::from_secs(60))).await;
+                        if !scan_done {
+                            warn!(base_path = %base_path.display(), "resident file scan timed out");
+                        }
+
+                        let update_result = this.update(cx, |this, cx| {
+                            this.scan_done = true;
+                            cx.notify();
+                            this.run_search(cx);
+                            info!(
+                                scan_done = this.scan_done,
+                                results = this.results.len(),
+                                "resident scan state applied to picker"
+                            );
+                        });
+
+                        if let Err(err) = update_result {
+                            warn!(
+                                error = %err,
+                                "failed to apply resident scan state to picker"
+                            );
+                        }
+                    },
+                )
+                .detach();
+            } else {
+                self.scan_done = true;
+                self.run_search(cx);
+                info!(
+                    scan_done = self.scan_done,
+                    results = self.results.len(),
+                    "resident scan state applied to picker"
+                );
+            }
+            return;
+        }
+
+        info!("starting file index");
 
         cx.spawn(
             async move |this: WeakEntity<FffPicker>, cx: &mut AsyncApp| {
                 smol::unblock(move || {
                     preview::warm_highlighter();
 
+                    trace!(home = ?std::env::var("HOME").ok(), "initializing shared trackers");
                     if let Ok(home) = std::env::var("HOME") {
                         let data_dir = PathBuf::from(home).join(".local/share/fff");
                         let _ = std::fs::create_dir_all(&data_dir);
@@ -265,34 +493,50 @@ impl FffPicker {
                             let _ = sq.init(tracker);
                         }
                     }
-                    let _ = FilePicker::new_with_shared_state(
+                    if let Err(err) = FilePicker::new_with_shared_state(
                         sp.clone(),
                         sf,
                         FilePickerOptions {
                             base_path: base_path.to_string_lossy().to_string(),
-                            enable_mmap_cache: true,
-                            enable_content_indexing: true,
+                            enable_mmap_cache: false,
+                            enable_content_indexing,
                             mode: FFFMode::Neovim,
                             watch: false,
                             ..Default::default()
                         },
-                    );
-                    sp.wait_for_scan(Duration::from_secs(60));
+                    ) {
+                        error!(error = %err, base_path = %base_path.display(), "failed to initialize file picker");
+                    }
+
+                    let scan_completed = sp.wait_for_scan(Duration::from_secs(60));
+                    if scan_completed {
+                        info!(base_path = %base_path.display(), "initial file scan completed");
+                    } else {
+                        warn!(base_path = %base_path.display(), "initial file scan timed out");
+                    }
                 })
                 .await;
 
-                this.update(cx, |this, cx| {
+                let update_result = this.update(cx, |this, cx| {
                     this.scan_done = true;
                     cx.notify();
                     this.run_search(cx);
-                })
-                .ok();
+                    info!(
+                        scan_done = this.scan_done,
+                        results = this.results.len(),
+                        "scan completion applied to picker state"
+                    );
+                });
+
+                if let Err(err) = update_result {
+                    warn!(error = %err, "failed to apply scan completion to picker state");
+                }
             },
         )
         .detach();
     }
 
-    // Run path and content search together, then render one merged result set.
+    // Run the active search view and render the corresponding result set.
     fn run_search(&mut self, cx: &mut Context<Self>) {
         if !self.scan_done {
             return;
@@ -315,118 +559,196 @@ impl FffPicker {
         let shared_picker = self.shared_picker.clone();
         let shared_query_tracker = self.shared_query_tracker.clone();
         let query_str = self.query.clone();
+        let view = self.view;
+        let grep_mode = self.grep_mode;
+        debug!(
+            epoch,
+            query = %query_str.trim(),
+            view = ?view,
+            grep_mode = ?grep_mode,
+            "starting search"
+        );
 
         cx.spawn(
             async move |this: WeakEntity<FffPicker>, cx: &mut AsyncApp| {
-                let (items, total_files, total_matched) = {
-                    let sp = shared_picker.clone();
-                    let sq = shared_query_tracker.clone();
-                    let q = query_str.clone();
-                    smol::unblock(move || -> (Vec<FileItemSnapshot>, usize, usize) {
-                        let Ok(guard) = sp.read() else {
-                            return (vec![], 0, 0);
-                        };
-                        let Some(picker) = guard.as_ref() else {
-                            return (vec![], 0, 0);
-                        };
+                let (items, total_files, total_matched) = smol::unblock(move || {
+                    let Ok(guard) = shared_picker.read() else {
+                        return (Vec::new(), 0, 0);
+                    };
+                    let Some(picker) = guard.as_ref() else {
+                        return (Vec::new(), 0, 0);
+                    };
 
-                        let parser = QueryParser::new(FileSearchConfig);
-                        let query = parser.parse(&q);
-                        let base = picker.base_path().to_path_buf();
-                        let query_tracker = sq.read().ok();
-                        let search = picker.fuzzy_search(
-                            &query,
-                            query_tracker
-                                .as_deref()
-                                .and_then(|tracker| tracker.as_ref()),
-                            FuzzySearchOptions {
-                                max_threads: search_threads(),
-                                project_path: Some(picker.base_path()),
-                                combo_boost_score_multiplier: 100,
-                                min_combo_count: 3,
-                                pagination: PaginationArgs {
-                                    offset: 0,
-                                    limit: 200,
+                    let base = picker.base_path().to_path_buf();
+                    let query = query_str.trim().to_string();
+
+                    match view {
+                        SearchView::Files => {
+                            let parser = QueryParser::new(FileSearchConfig);
+                            let parsed = parser.parse(&query);
+                            let query_tracker = shared_query_tracker.read().ok();
+                            let search = picker.fuzzy_search(
+                                &parsed,
+                                query_tracker
+                                    .as_deref()
+                                    .and_then(|tracker| tracker.as_ref()),
+                                FuzzySearchOptions {
+                                    max_threads: search_threads(),
+                                    project_path: Some(picker.base_path()),
+                                    combo_boost_score_multiplier: 100,
+                                    min_combo_count: 3,
+                                    pagination: PaginationArgs {
+                                        offset: 0,
+                                        limit: 200,
+                                    },
+                                    ..Default::default()
                                 },
-                                ..Default::default()
-                            },
-                        );
-                        let total_files = search.total_files;
-                        let fuzzy_total_matched = search.total_matched;
-                        let fuzzy_items: Vec<FileItemSnapshot> = search
-                            .items
-                            .iter()
-                            .filter(|fi| !fi.is_binary())
-                            .map(|fi| {
-                                let file_name = fi.file_name(picker);
-                                let dir = fi.dir_str(picker);
-                                let absolute_path = fi.absolute_path(picker, &base);
-                                let match_ranges = find_match_ranges(&q, &file_name);
-                                FileItemSnapshot {
-                                    file_name,
-                                    dir,
-                                    absolute_path,
-                                    match_ranges,
-                                    grep_matches: vec![],
-                                }
-                            })
-                            .collect();
+                            );
+                            let fuzzy_items = search
+                                .items
+                                .iter()
+                                .filter(|fi| !fi.is_binary())
+                                .map(|fi| {
+                                    let file_name = fi.file_name(picker);
+                                    let dir = fi.dir_str(picker);
+                                    let absolute_path = fi.absolute_path(picker, &base);
+                                    FileItemSnapshot {
+                                        git_status: format_git_status_opt(fi.git_status)
+                                            .map(str::to_string),
+                                        match_ranges: find_match_ranges(&query, &file_name),
+                                        file_name,
+                                        dir,
+                                        absolute_path,
+                                        grep_matches: vec![],
+                                    }
+                                })
+                                .collect::<Vec<_>>();
 
-                        if q.trim().is_empty() {
-                            return (fuzzy_items, total_files, fuzzy_total_matched);
-                        }
+                            if query.is_empty() {
+                                return (fuzzy_items, search.total_files, search.total_matched);
+                            }
 
-                        let query = parse_grep_query(&q);
-                        let content_only = !should_allow_fuzzy_fallback(&q);
-                        let grep_result = picker.grep(
-                            &query,
-                            &GrepSearchOptions {
-                                mode: GrepMode::PlainText,
-                                page_limit: 200,
-                                max_matches_per_file: 5,
-                                smart_case: true,
-                                abort_signal: Some(abort_signal),
-                                ..Default::default()
-                            },
-                        );
-
-                        // Index grep matches by path (not file index) so we can join with fuzzy
-                        // results using path as the key.
-                        let mut grep_by_path: std::collections::HashMap<
-                            PathBuf,
-                            Vec<GrepMatchLine>,
-                        > = std::collections::HashMap::new();
-                        // grep_order preserves the ranking returned by the grep engine.
-                        let mut grep_order: Vec<PathBuf> = Vec::new();
-                        // Keep one fi_index per path so we can reconstruct FileItemSnapshot for
-                        // grep-only hits later.
-                        let mut grep_fi_index: std::collections::HashMap<PathBuf, usize> =
-                            std::collections::HashMap::new();
-                        for gm in grep_result.matches.iter() {
-                            let Some(fi) = grep_result.files.get(gm.file_index) else {
-                                continue;
+                            let grep_query = fff_search::grep::parse_grep_query(&query);
+                            let primary_mode = if has_regex_metacharacters(&query) {
+                                GrepMode::Regex
+                            } else {
+                                GrepMode::PlainText
                             };
-                            if fi.is_binary() {
-                                continue;
-                            }
-                            let path = fi.absolute_path(picker, &base);
-                            if !grep_by_path.contains_key(&path) {
-                                grep_order.push(path.clone());
-                                grep_fi_index.insert(path.clone(), gm.file_index);
-                            }
-                            grep_by_path.entry(path).or_default().push(GrepMatchLine {
-                                line_number: gm.line_number,
-                                line_content: gm.line_content.clone(),
-                                byte_ranges: gm.match_byte_offsets.iter().copied().collect(),
-                            });
-                        }
 
-                        // content_only (query has spaces / punctuation): show only grep hits.
-                        if content_only {
-                            if grep_order.is_empty() {
-                                return (vec![], total_files, 0);
+                            let run_grep = |mode| {
+                                picker.grep(
+                                    &grep_query,
+                                    &GrepSearchOptions {
+                                        mode,
+                                        page_limit: 200,
+                                        max_matches_per_file: 5,
+                                        smart_case: true,
+                                        abort_signal: Some(abort_signal.clone()),
+                                        ..Default::default()
+                                    },
+                                )
+                            };
+
+                            let mut grep_result = run_grep(primary_mode);
+                            if grep_result.matches.is_empty() && primary_mode == GrepMode::PlainText
+                            {
+                                grep_result = run_grep(GrepMode::Fuzzy);
                             }
-                            let mut items: Vec<FileItemSnapshot> = Vec::new();
+
+                            let allow_fuzzy_fallback = should_allow_fuzzy_fallback(&query);
+                            if !allow_fuzzy_fallback {
+                                let mut items: Vec<FileItemSnapshot> = Vec::new();
+                                let mut total_files_seen =
+                                    grep_result.total_files.max(grep_result.filtered_file_count);
+
+                                for gm in &grep_result.matches {
+                                    let Some(fi) = grep_result.files.get(gm.file_index) else {
+                                        continue;
+                                    };
+                                    if fi.is_binary() {
+                                        continue;
+                                    }
+                                    let absolute_path = fi.absolute_path(picker, &base);
+                                    let file_name = fi.file_name(picker);
+                                    let dir = fi.dir_str(picker);
+                                    items.push(FileItemSnapshot {
+                                        git_status: format_git_status_opt(fi.git_status)
+                                            .map(str::to_string),
+                                        match_ranges: find_match_ranges(&query, &file_name),
+                                        file_name,
+                                        dir,
+                                        absolute_path,
+                                        grep_matches: vec![GrepMatchLine {
+                                            line_number: gm.line_number,
+                                            line_content: gm.line_content.clone(),
+                                            byte_ranges: gm
+                                                .match_byte_offsets
+                                                .iter()
+                                                .copied()
+                                                .collect(),
+                                        }],
+                                    });
+                                }
+
+                                if items.is_empty() {
+                                    total_files_seen = search.total_files;
+                                }
+
+                                let total_matched = items.len();
+                                return (items, total_files_seen, total_matched);
+                            }
+
+                            let mut grep_by_path =
+                                std::collections::HashMap::<PathBuf, Vec<GrepMatchLine>>::new();
+                            let mut grep_order: Vec<PathBuf> = Vec::new();
+                            let mut grep_fi_index =
+                                std::collections::HashMap::<PathBuf, usize>::new();
+
+                            for gm in &grep_result.matches {
+                                let Some(fi) = grep_result.files.get(gm.file_index) else {
+                                    continue;
+                                };
+                                if fi.is_binary() {
+                                    continue;
+                                }
+                                let path = fi.absolute_path(picker, &base);
+                                if !grep_by_path.contains_key(&path) {
+                                    grep_order.push(path.clone());
+                                    grep_fi_index.insert(path.clone(), gm.file_index);
+                                }
+                                grep_by_path.entry(path).or_default().push(GrepMatchLine {
+                                    line_number: gm.line_number,
+                                    line_content: gm.line_content.clone(),
+                                    byte_ranges: gm.match_byte_offsets.iter().copied().collect(),
+                                });
+                            }
+
+                            if grep_order.is_empty() {
+                                return (fuzzy_items, search.total_files, search.total_matched);
+                            }
+
+                            let mut fuzzy_by_path: std::collections::HashMap<
+                                PathBuf,
+                                FileItemSnapshot,
+                            > = std::collections::HashMap::new();
+                            let mut fuzzy_order = Vec::with_capacity(fuzzy_items.len());
+                            for item in fuzzy_items {
+                                fuzzy_order.push(item.absolute_path.clone());
+                                fuzzy_by_path.insert(item.absolute_path.clone(), item);
+                            }
+
+                            let mut merged: Vec<FileItemSnapshot> = Vec::new();
+
+                            for path in &fuzzy_order {
+                                let Some(mut item) = fuzzy_by_path.remove(path) else {
+                                    continue;
+                                };
+                                if let Some(grep_matches) = grep_by_path.remove(path) {
+                                    item.grep_matches = grep_matches;
+                                }
+                                merged.push(item);
+                            }
+
                             for path in &grep_order {
                                 let Some(grep_matches) = grep_by_path.remove(path) else {
                                     continue;
@@ -439,91 +761,65 @@ impl FffPicker {
                                 };
                                 let file_name = fi.file_name(picker);
                                 let dir = fi.dir_str(picker);
-                                items.push(FileItemSnapshot {
-                                    match_ranges: find_match_ranges(&q, &file_name),
+                                merged.push(FileItemSnapshot {
+                                    git_status: format_git_status_opt(fi.git_status)
+                                        .map(str::to_string),
+                                    match_ranges: find_match_ranges(&query, &file_name),
                                     file_name,
                                     dir,
                                     absolute_path: path.clone(),
                                     grep_matches,
                                 });
                             }
-                            let total_matched = items.len();
-                            return (items, total_files, total_matched);
+
+                            let total_matched = merged.len().max(search.total_matched);
+                            (merged, search.total_files, total_matched)
                         }
-
-                        // Identifier-like query: fuzzy (filename) results rank first so that
-                        // e.g. "main.rs" surfaces the actual file above files that reference it.
-                        // Grep matches are attached to fuzzy hits when available, and any
-                        // content-only hits are appended afterwards.
-                        if grep_order.is_empty() {
-                            return (fuzzy_items, total_files, fuzzy_total_matched);
-                        }
-
-                        let mut fuzzy_by_path: std::collections::HashMap<
-                            PathBuf,
-                            FileItemSnapshot,
-                        > = std::collections::HashMap::new();
-                        let mut fuzzy_order = Vec::with_capacity(fuzzy_items.len());
-                        for item in fuzzy_items {
-                            fuzzy_order.push(item.absolute_path.clone());
-                            fuzzy_by_path.insert(item.absolute_path.clone(), item);
-                        }
-
-                        let mut items: Vec<FileItemSnapshot> = Vec::new();
-
-                        // 1. Fuzzy results in score order; attach grep matches where available.
-                        for path in &fuzzy_order {
-                            let Some(mut item) = fuzzy_by_path.remove(path) else {
-                                continue;
-                            };
-                            if let Some(grep_matches) = grep_by_path.remove(path) {
-                                item.grep_matches = grep_matches;
+                        SearchView::Grep => {
+                            if query.is_empty() {
+                                return (Vec::new(), 0, 0);
                             }
-                            items.push(item);
+
+                            execute_grep_search(picker, &query_str, &base, abort_signal, grep_mode)
                         }
+                    }
+                })
+                .await;
 
-                        // 2. Content-only hits (grep results not present in fuzzy results).
-                        for path in &grep_order {
-                            let Some(grep_matches) = grep_by_path.remove(path) else {
-                                continue; // already consumed above
-                            };
-                            let Some(&fi_idx) = grep_fi_index.get(path) else {
-                                continue;
-                            };
-                            let Some(fi) = grep_result.files.get(fi_idx) else {
-                                continue;
-                            };
-                            let file_name = fi.file_name(picker);
-                            let dir = fi.dir_str(picker);
-                            items.push(FileItemSnapshot {
-                                match_ranges: find_match_ranges(&q, &file_name),
-                                file_name,
-                                dir,
-                                absolute_path: path.clone(),
-                                grep_matches,
-                            });
-                        }
-
-                        let total_matched = items.len().max(fuzzy_total_matched);
-                        (items, total_files, total_matched)
-                    })
-                    .await
-                };
-
-                this.update(cx, |this, cx| {
+                let update_result = this.update(cx, |this, cx| {
                     if this.search_epoch != epoch {
+                        trace!(epoch, "discarding stale search result");
                         this.finish_search(cx);
                         return;
                     }
+                    debug!(
+                        epoch,
+                        results = items.len(),
+                        total_files,
+                        total_matched,
+                        "applying search result"
+                    );
                     this.results = items;
                     this.total_files = total_files;
                     this.total_matched = total_matched;
                     this.selected = 0;
+                    this.preview_scroll_row = 0;
+                    this.selected_paths
+                        .retain(|path| this.results.iter().any(|item| &item.absolute_path == path));
                     this.load_preview(cx);
                     cx.notify();
                     this.finish_search(cx);
-                })
-                .ok();
+                    trace!(
+                        epoch,
+                        scan_done = this.scan_done,
+                        results = this.results.len(),
+                        "search result applied to picker state"
+                    );
+                });
+
+                if let Err(err) = update_result {
+                    warn!(error = %err, epoch, "failed to apply search result to picker state");
+                }
             },
         )
         .detach();
@@ -553,11 +849,39 @@ impl FffPicker {
             Some(r) => (r.absolute_path.clone(), r.grep_matches.clone()),
             None => {
                 self.preview_lines = vec![];
+                self.preview_loading = false;
+                self.preview_loading_visible = false;
+                self.preview_scroll_row = 0;
                 return;
             }
         };
 
+        self.preview_loading = true;
+        self.preview_loading_visible = false;
+        trace!(
+            preview_epoch,
+            path = %path.display(),
+            grep_matches = grep_matches.len(),
+            "loading preview"
+        );
         let first_match_line = grep_matches.iter().map(|m| m.line_number as usize).min();
+
+        cx.spawn(
+            async move |this: WeakEntity<FffPicker>, cx: &mut AsyncApp| {
+                smol::Timer::after(Duration::from_millis(120)).await;
+                this.update(cx, |this, cx| {
+                    if this.preview_epoch == preview_epoch
+                        && this.preview_loading
+                        && this.preview_lines.is_empty()
+                    {
+                        this.preview_loading_visible = true;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            },
+        )
+        .detach();
 
         cx.spawn(
             async move |this: WeakEntity<FffPicker>, cx: &mut AsyncApp| {
@@ -577,12 +901,16 @@ impl FffPicker {
 
                 this.update(cx, |this, cx| {
                     if this.preview_epoch != preview_epoch {
+                        trace!(preview_epoch, "discarding stale preview result");
                         return;
                     }
                     this.preview_lines = lines;
-                    let scroll_to = first_match_line
+                    this.preview_loading = false;
+                    this.preview_loading_visible = false;
+                    this.preview_scroll_row = first_match_line
                         .map(|line| line.saturating_sub(start_line))
                         .unwrap_or(0);
+                    let scroll_to = this.preview_scroll_row;
                     this.preview_scroll.scroll_to_item(
                         scroll_to.saturating_sub(preview::MATCH_CONTEXT_BEFORE),
                         ScrollStrategy::Top,
@@ -595,42 +923,61 @@ impl FffPicker {
         .detach();
     }
 
-    // Quit the picker process.
-    fn on_quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
-        cx.quit();
-    }
-
-    // Open the selected file and leave the finder window visible for the next invocation.
-    fn on_open_selected(&mut self, _: &OpenSelected, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.results.get(self.selected) else {
+    // Open the selected file or the first selected file and track the query.
+    fn on_open_selected(&mut self, _: &OpenSelected, window: &mut Window, cx: &mut Context<Self>) {
+        let selected_path = self.selected_paths.iter().next().cloned().or_else(|| {
+            self.results
+                .get(self.selected)
+                .map(|item| item.absolute_path.clone())
+        });
+        let Some(path) = selected_path else {
             return;
         };
-        let path = item.absolute_path.clone();
 
-        if let Ok(guard) = self.shared_frecency.read() {
-            if let Some(tracker) = guard.as_ref() {
-                let _ = tracker.track_access(&path);
+        if let Ok(guard) = self.shared_picker.read()
+            && let Some(picker) = guard.as_ref()
+        {
+            if let Ok(mut tracker_guard) = self.shared_query_tracker.write()
+                && let Some(tracker) = tracker_guard.as_mut()
+            {
+                let project_path = picker.base_path();
+                match self.view {
+                    SearchView::Files => {
+                        let _ = tracker.track_query_completion(&self.query, project_path, &path);
+                    }
+                    SearchView::Grep => {
+                        let _ = tracker.track_grep_query(&self.query, project_path);
+                    }
+                }
             }
         }
 
-        match editor::open_in_editor(&path) {
+        if let Ok(guard) = self.shared_frecency.read()
+            && let Some(tracker) = guard.as_ref()
+        {
+            let _ = tracker.track_access(&path);
+        }
+
+        match editor::open_in_editor(&path, None) {
             Ok(child) => {
-                log::append(format!(
-                    "fff-gpui: spawned editor pid {} for {}",
-                    child.id(),
-                    path.display()
-                ));
+                info!(pid = child.id(), path = %path.display(), "spawned editor");
                 self.status_message = Some(format!("Opened {}", path.display()));
                 cx.notify();
+                window.remove_window();
             }
             Err(err) => {
+                error!(error = %err, path = %path.display(), "open failed");
                 let message = format!("Open failed: {err}");
-                log::append(format!("fff-gpui: {message}"));
                 self.status_message =
                     Some(format!("{message}  (log: {})", log::path_for_display()));
                 cx.notify();
             }
         }
+    }
+
+    // Close the current picker window without terminating the resident service.
+    fn on_quit(&mut self, _: &Quit, window: &mut Window, _cx: &mut Context<Self>) {
+        window.remove_window();
     }
 
     // Move selection down one row.
@@ -655,6 +1002,134 @@ impl FffPicker {
         }
     }
 
+    // Select the clicked row and refresh the preview.
+    fn on_select_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.results.len() {
+            return;
+        }
+
+        if self.selected == index {
+            self.on_open_selected(&OpenSelected, window, cx);
+            return;
+        }
+
+        self.selected = index;
+        self.list_scroll
+            .scroll_to_item(self.selected, ScrollStrategy::Center);
+        self.load_preview(cx);
+        window.focus(&self.text_field_focus_handle(cx));
+        cx.notify();
+    }
+
+    // Toggle the selected state for the current row.
+    fn on_toggle_selected(
+        &mut self,
+        _: &ToggleSelected,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.results.get(self.selected) else {
+            return;
+        };
+        if !self.selected_paths.insert(item.absolute_path.clone()) {
+            self.selected_paths.remove(&item.absolute_path);
+        }
+        cx.notify();
+    }
+
+    // Cycle through the available grep modes.
+    fn on_cycle_grep_mode(
+        &mut self,
+        _: &CycleGrepMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.grep_mode = match self.grep_mode {
+            GrepMode::PlainText => GrepMode::Regex,
+            GrepMode::Regex => GrepMode::Fuzzy,
+            GrepMode::Fuzzy => GrepMode::PlainText,
+        };
+        self.status_message = Some(format!("Grep mode: {:?}", self.grep_mode));
+        self.run_search(cx);
+    }
+
+    // Restore the previous query from the local search history.
+    fn on_cycle_previous_query(
+        &mut self,
+        _: &CyclePreviousQuery,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(query) = (|| {
+            let guard = self.shared_query_tracker.read().ok()?;
+            let tracker = guard.as_ref()?;
+            let picker_guard = self.shared_picker.read().ok()?;
+            let picker = picker_guard.as_ref()?;
+            let project_path = picker.base_path();
+            match self.view {
+                SearchView::Files => tracker.get_historical_query(project_path, 0).ok().flatten(),
+                SearchView::Grep => tracker
+                    .get_historical_grep_query(project_path, 0)
+                    .ok()
+                    .flatten(),
+            }
+        })() else {
+            self.status_message = Some("No query history".to_string());
+            cx.notify();
+            return;
+        };
+
+        self.text_field
+            .update(cx, |field, cx| field.set_text(query, cx));
+    }
+
+    // Scroll the preview pane toward the top.
+    fn on_preview_scroll_up(
+        &mut self,
+        _: &PreviewScrollUp,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.preview_scroll_row = self.preview_scroll_row.saturating_sub(6);
+        self.preview_scroll
+            .scroll_to_item(self.preview_scroll_row, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    // Scroll the preview pane toward the bottom.
+    fn on_preview_scroll_down(
+        &mut self,
+        _: &PreviewScrollDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.preview_lines.is_empty() {
+            self.preview_scroll_row =
+                (self.preview_scroll_row + 6).min(self.preview_lines.len() - 1);
+            self.preview_scroll
+                .scroll_to_item(self.preview_scroll_row, ScrollStrategy::Top);
+            cx.notify();
+        }
+    }
+
+    // Switch back to file search mode.
+    fn on_switch_files(&mut self, _: &SwitchFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.view != SearchView::Files {
+            self.view = SearchView::Files;
+            self.status_message = None;
+            self.run_search(cx);
+        }
+    }
+
+    // Switch to live grep mode.
+    fn on_switch_grep(&mut self, _: &SwitchGrep, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.view != SearchView::Grep {
+            self.view = SearchView::Grep;
+            self.status_message = None;
+            self.run_search(cx);
+        }
+    }
+
     // Return the text field focus handle so the window can focus it on startup.
     pub fn text_field_focus_handle(&self, cx: &App) -> FocusHandle {
         self.text_field.focus_handle(cx)
@@ -670,11 +1145,30 @@ impl Render for FffPicker {
         let scan_done = self.scan_done;
         let total_files = self.total_files;
         let total_matched = self.total_matched;
+        let selected_count = self.selected_paths.len();
+        let selected_paths = self.selected_paths.clone();
         let list_scroll = self.list_scroll.clone();
         let preview_scroll = self.preview_scroll.clone();
         let selected_path = results.get(selected).map(|item| item.absolute_path.clone());
-        let preview_placeholder = if selected_path.is_some() {
+        trace!(
+            scan_done,
+            results = results.len(),
+            selected,
+            preview_lines = preview_lines.len(),
+            selected_count,
+            view = ?self.view,
+            query = %self.query,
+            status_message = ?self.status_message,
+            "rendering picker"
+        );
+        let preview_placeholder = if !scan_done {
+            ""
+        } else if self.preview_loading_visible {
             "Loading\u{2026}"
+        } else if selected_path.is_some() && preview_lines.is_empty() {
+            "No preview"
+        } else if self.view == SearchView::Grep && self.query.trim().is_empty() {
+            "Type to grep"
         } else {
             "No preview"
         };
@@ -682,10 +1176,10 @@ impl Render for FffPicker {
         let status_text = if let Some(message) = self.status_message.clone() {
             message
         } else if !scan_done {
-            "Indexing\u{2026}".to_string()
+            String::new()
         } else {
             format!(
-                "{} shown  {total_matched} file matches  {total_files} indexed",
+                "{} shown  {selected_count} selected  {total_matched} matches  {total_files} indexed",
                 results.len()
             )
         };
@@ -696,6 +1190,13 @@ impl Render for FffPicker {
             .on_action(cx.listener(Self::on_open_selected))
             .on_action(cx.listener(Self::on_select_next))
             .on_action(cx.listener(Self::on_select_prev))
+            .on_action(cx.listener(Self::on_toggle_selected))
+            .on_action(cx.listener(Self::on_cycle_grep_mode))
+            .on_action(cx.listener(Self::on_cycle_previous_query))
+            .on_action(cx.listener(Self::on_preview_scroll_up))
+            .on_action(cx.listener(Self::on_preview_scroll_down))
+            .on_action(cx.listener(Self::on_switch_files))
+            .on_action(cx.listener(Self::on_switch_grep))
             .size_full()
             .flex()
             .flex_col()
@@ -710,25 +1211,11 @@ impl Render for FffPicker {
                     .overflow_hidden()
                     .child(
                         div()
-                    .w(px(430.0))
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(30.0))
-                            .pl(px(80.0))
-                            .pr(px(12.0))
+                            .w(px(430.0))
+                            .h_full()
                             .flex()
-                            .items_center()
-                            .border_b_1()
-                            .border_color(rgb(theme::BORDER))
-                            .text_xs()
-                            .text_color(rgb(theme::TEXT_SECONDARY))
-                            .child("fff-gpui"),
-                    )
+                            .flex_col()
+                            .overflow_hidden()
                     .child(
                 div()
                     .flex_1()
@@ -773,15 +1260,16 @@ impl Render for FffPicker {
                                 uniform_list(
                                     "results",
                                     results.len(),
-                                    move |range, _window, _cx| {
+                                    cx.processor(move |_this, range: std::ops::Range<usize>, _window, cx| {
                                         range
                                             .map(|i| {
                                                 let item = &results[i];
                                                 let is_selected = i == selected;
+                                                let is_marked = selected_paths.contains(&item.absolute_path);
                                                 let display_dir = shorten_dir_for_row(&item.dir, 30);
+                                                let git_badge =
+                                                    git_status_badge(item.git_status.as_deref());
 
-                                                // For content-only matches show the first matched
-                                                // line instead of the filename (which won't match).
                                                 let content_match: Option<(String, Vec<Range<usize>>)> =
                                                     if item.match_ranges.is_empty() {
                                                         item.grep_matches.first().map(|m| {
@@ -823,16 +1311,28 @@ impl Render for FffPicker {
                                                         rgb(theme::BG)
                                                     })
                                                     .hover(|s| s.bg(rgb(theme::HOVER_ROW)))
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                                        this.on_select_row(i, window, cx);
+                                                    }))
                                                     .child(
                                                         div()
                                                             .w(px(8.0))
                                                             .flex_shrink_0()
                                                             .text_color(if is_selected {
                                                                 rgb(theme::MATCH_HIGHLIGHT)
+                                                            } else if is_marked {
+                                                                rgb(theme::TEXT_PRIMARY)
                                                             } else {
                                                                 rgb(theme::TEXT_DIM)
                                                             })
-                                                            .child(if is_selected { "\u{203A}" } else { " " }),
+                                                            .child(if is_marked {
+                                                                "\u{258A}"
+                                                            } else if is_selected {
+                                                                "\u{203A}"
+                                                            } else {
+                                                                " "
+                                                            }),
                                                     )
                                                     .child(
                                                         div()
@@ -841,7 +1341,6 @@ impl Render for FffPicker {
                                                             .overflow_hidden()
                                                             .text_sm()
                                                             .when(content_match.is_some(), |d| {
-                                                                // Show filename dim + matched content
                                                                 let (text, ranges) =
                                                                     content_match.as_ref().unwrap();
                                                                 d.flex()
@@ -897,6 +1396,15 @@ impl Render for FffPicker {
                                                             .flex_shrink_0()
                                                             .items_center()
                                                             .gap(px(4.0))
+                                                            .when(git_badge.is_some(), |this| {
+                                                                let (label, color) = git_badge.unwrap();
+                                                                this.child(
+                                                                    div()
+                                                                        .text_xs()
+                                                                        .text_color(rgb(color))
+                                                                        .child(label),
+                                                                )
+                                                            })
                                                             .when(
                                                                 !item.grep_matches.is_empty(),
                                                                 |this| {
@@ -929,7 +1437,7 @@ impl Render for FffPicker {
                                                     )
                                             })
                                             .collect()
-                                    },
+                                    }),
                                 )
                                 .flex_1()
                                 .w_full()
