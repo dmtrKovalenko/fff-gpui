@@ -11,6 +11,7 @@ pub const MATCH_CONTEXT_BEFORE: usize = 8;
 #[derive(Clone)]
 pub struct HighlightedSpan {
     pub color: u32,
+    pub bg: Option<u32>,
     pub italic: bool,
     pub bold: bool,
     pub underline: bool,
@@ -193,6 +194,7 @@ fn append_span(
 
     line.spans.push(HighlightedSpan {
         color,
+        bg: None,
         italic,
         bold,
         underline,
@@ -292,6 +294,7 @@ fn plain_text_lines(content: &str) -> Vec<HighlightedLine> {
             let style = theme::syntax_render_style("text");
             current.spans.push(HighlightedSpan {
                 color: style.color,
+                bg: None,
                 italic: style.italic,
                 bold: style.bold,
                 underline: style.underline,
@@ -343,6 +346,7 @@ pub fn overlay_match_ranges(
     spans: &[HighlightedSpan],
     byte_ranges: &[(u32, u32)],
     match_color: u32,
+    match_bg: Option<u32>,
 ) -> Vec<HighlightedSpan> {
     if byte_ranges.is_empty() {
         return spans.to_vec();
@@ -373,6 +377,7 @@ pub fn overlay_match_ranges(
             {
                 result.push(HighlightedSpan {
                     color: span.color,
+                    bg: span.bg,
                     italic: span.italic,
                     bold: span.bold,
                     underline: span.underline,
@@ -386,6 +391,7 @@ pub fn overlay_match_ranges(
             if let Some((hi_s, hi_e)) = clamp_range_to_char_boundaries(&span.text, hi_s, hi_e) {
                 result.push(HighlightedSpan {
                     color: match_color,
+                    bg: match_bg,
                     italic: span.italic,
                     bold: span.bold,
                     underline: span.underline,
@@ -403,6 +409,7 @@ pub fn overlay_match_ranges(
         {
             result.push(HighlightedSpan {
                 color: span.color,
+                bg: span.bg,
                 italic: span.italic,
                 bold: span.bold,
                 underline: span.underline,

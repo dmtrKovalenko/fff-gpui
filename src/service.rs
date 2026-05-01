@@ -8,8 +8,8 @@ use tracing::{debug, info, instrument, warn};
 
 #[derive(Debug, Clone)]
 pub enum ServiceCommand {
-    OpenPath(PathBuf),
-    OpenOneShot(PathBuf),
+    OpenPath { path: PathBuf, in_grep: bool },
+    OpenOneShot { path: PathBuf, in_grep: bool },
     OpenConfig,
     ShowPicker,
     ToggleWindow,
@@ -30,16 +30,25 @@ fn read_request(line: String) -> Option<ServiceCommand> {
         return None;
     }
 
-    if let Some(path) = trimmed.strip_prefix("open\t") {
-        return Some(ServiceCommand::OpenOneShot(PathBuf::from(path)));
+    fn split_path_and_grep(payload: &str) -> (PathBuf, bool) {
+        match payload.split_once('\t') {
+            Some((path, "grep")) => (PathBuf::from(path), true),
+            _ => (PathBuf::from(payload), false),
+        }
+    }
+
+    if let Some(payload) = trimmed.strip_prefix("open\t") {
+        let (path, in_grep) = split_path_and_grep(payload);
+        return Some(ServiceCommand::OpenOneShot { path, in_grep });
     }
 
     if trimmed == "config" {
         return Some(ServiceCommand::OpenConfig);
     }
 
-    if let Some(path) = trimmed.strip_prefix("path\t") {
-        return Some(ServiceCommand::OpenPath(PathBuf::from(path)));
+    if let Some(payload) = trimmed.strip_prefix("path\t") {
+        let (path, in_grep) = split_path_and_grep(payload);
+        return Some(ServiceCommand::OpenPath { path, in_grep });
     }
 
     match trimmed {
@@ -49,7 +58,10 @@ fn read_request(line: String) -> Option<ServiceCommand> {
         _ => {}
     }
 
-    (!trimmed.is_empty()).then(|| ServiceCommand::OpenPath(PathBuf::from(trimmed)))
+    (!trimmed.is_empty()).then(|| ServiceCommand::OpenPath {
+        path: PathBuf::from(trimmed),
+        in_grep: false,
+    })
 }
 
 #[cfg(not(unix))]
@@ -58,9 +70,23 @@ fn read_request(_line: String) -> Option<ServiceCommand> {
 }
 
 fn write_request(stream: &mut impl Write, command: &ServiceCommand) -> Result<()> {
+    fn grep_suffix(in_grep: bool) -> &'static str {
+        if in_grep { "\tgrep" } else { "" }
+    }
+
     match command {
-        ServiceCommand::OpenPath(path) => writeln!(stream, "path\t{}", path.display()),
-        ServiceCommand::OpenOneShot(path) => writeln!(stream, "open\t{}", path.display()),
+        ServiceCommand::OpenPath { path, in_grep } => writeln!(
+            stream,
+            "path\t{}{}",
+            path.display(),
+            grep_suffix(*in_grep)
+        ),
+        ServiceCommand::OpenOneShot { path, in_grep } => writeln!(
+            stream,
+            "open\t{}{}",
+            path.display(),
+            grep_suffix(*in_grep)
+        ),
         ServiceCommand::OpenConfig => writeln!(stream, "config"),
         ServiceCommand::ShowPicker => writeln!(stream, "show"),
         ServiceCommand::ToggleWindow => writeln!(stream, "toggle"),
@@ -83,11 +109,11 @@ pub fn forward_to_running_instance(command: &ServiceCommand) -> Result<bool> {
                 write_request(&mut stream, command)?;
                 let _ = stream.flush();
                 info!("forwarded launch request to resident service");
-                return Ok(true);
+                Ok(true)
             }
             Err(err) => {
                 debug!(error = %err, "no resident service available");
-                return Ok(false);
+                Ok(false)
             }
         }
     }

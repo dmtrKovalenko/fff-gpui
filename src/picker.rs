@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -23,7 +23,7 @@ use crate::log;
 use crate::path_shortening::PathShortenStrategy;
 use crate::preview::{self, HighlightedLine};
 use crate::text_field::TextField;
-use crate::theme;
+use crate::theme::{self, AppTheme};
 
 actions!(
     fff_picker,
@@ -33,6 +33,8 @@ actions!(
         SelectNext,
         SelectPrev,
         ToggleSelected,
+        ToggleSelectedAndAdvance,
+        ShiftTab,
         CycleGrepMode,
         CyclePreviousQuery,
         PreviewScrollUp,
@@ -261,7 +263,7 @@ fn git_status_badge(status: Option<&str>) -> Option<(&'static str, u32)> {
 fn execute_grep_search(
     picker: &FilePicker,
     query: &str,
-    base: &PathBuf,
+    base: &Path,
     abort_signal: Arc<AtomicBool>,
     grep_mode: GrepMode,
 ) -> (Vec<FileItemSnapshot>, usize, usize) {
@@ -340,6 +342,7 @@ impl FffPicker {
         base_path: PathBuf,
         shared: PickerSharedState,
         enable_content_indexing: bool,
+        start_in_grep: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let text_field = cx.new(|cx| TextField::new("Search files...", cx));
@@ -360,8 +363,12 @@ impl FffPicker {
             shared_picker: shared.shared_picker,
             shared_frecency: shared.shared_frecency,
             shared_query_tracker: shared.shared_query_tracker,
-            view: SearchView::Files,
-            grep_mode: GrepMode::Fuzzy,
+            view: if start_in_grep {
+                SearchView::Grep
+            } else {
+                SearchView::Files
+            },
+            grep_mode: GrepMode::PlainText,
             query: String::new(),
             results: Vec::new(),
             total_files: 0,
@@ -872,7 +879,9 @@ impl FffPicker {
             "loading preview"
         );
         let first_match_line = grep_matches.iter().map(|m| m.line_number as usize).min();
-        let match_highlight = theme::palette().match_highlight;
+        let theme = cx.global::<AppTheme>();
+        let match_highlight = theme.palette.match_highlight;
+        let match_bg = theme.palette.match_highlight_bg;
 
         cx.spawn(
             async move |this: WeakEntity<FffPicker>, cx: &mut AsyncApp| {
@@ -903,6 +912,7 @@ impl FffPicker {
                                 &line.spans,
                                 &gm.byte_ranges,
                                 match_highlight,
+                                Some(match_bg),
                             );
                         }
                     }
@@ -945,21 +955,36 @@ impl FffPicker {
         let Some(path) = selected_path else {
             return;
         };
+        let goto = self
+            .results
+            .iter()
+            .find(|item| item.absolute_path == path)
+            .and_then(|item| item.grep_matches.first())
+            .map(|m| {
+                let line = m.line_number as usize;
+                let column = m
+                    .byte_ranges
+                    .first()
+                    .and_then(|(start, _)| {
+                        let start = *start as usize;
+                        m.line_content.get(..start).map(|prefix| prefix.chars().count() + 1)
+                    })
+                    .unwrap_or(1);
+                (line, column)
+            });
 
         if let Ok(guard) = self.shared_picker.read()
             && let Some(picker) = guard.as_ref()
+            && let Ok(mut tracker_guard) = self.shared_query_tracker.write()
+            && let Some(tracker) = tracker_guard.as_mut()
         {
-            if let Ok(mut tracker_guard) = self.shared_query_tracker.write()
-                && let Some(tracker) = tracker_guard.as_mut()
-            {
-                let project_path = picker.base_path();
-                match self.view {
-                    SearchView::Files => {
-                        let _ = tracker.track_query_completion(&self.query, project_path, &path);
-                    }
-                    SearchView::Grep => {
-                        let _ = tracker.track_grep_query(&self.query, project_path);
-                    }
+            let project_path = picker.base_path();
+            match self.view {
+                SearchView::Files => {
+                    let _ = tracker.track_query_completion(&self.query, project_path, &path);
+                }
+                SearchView::Grep => {
+                    let _ = tracker.track_grep_query(&self.query, project_path);
                 }
             }
         }
@@ -970,7 +995,7 @@ impl FffPicker {
             let _ = tracker.track_access(&path);
         }
 
-        match editor::open_in_editor(&path, None) {
+        match editor::open_in_editor(&path, goto) {
             Ok(child) => {
                 info!(pid = child.id(), path = %path.display(), "spawned editor");
                 self.status_message = Some(format!("Opened {}", path.display()));
@@ -1049,6 +1074,27 @@ impl FffPicker {
         cx.notify();
     }
 
+    // Toggle the selected state for the current row, then advance the cursor up
+    // (toward the next worse-ranked result). The list is bottom-up, so "next" in
+    // the user's mental model maps to SelectPrev internally.
+    fn on_toggle_and_advance(
+        &mut self,
+        _: &ToggleSelectedAndAdvance,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_toggle_selected(&ToggleSelected, window, cx);
+        self.on_select_prev(&SelectPrev, window, cx);
+    }
+
+    // Shift-tab: cycle grep mode in grep view, otherwise move selection up.
+    fn on_shift_tab(&mut self, _: &ShiftTab, window: &mut Window, cx: &mut Context<Self>) {
+        match self.view {
+            SearchView::Grep => self.on_cycle_grep_mode(&CycleGrepMode, window, cx),
+            SearchView::Files => self.on_select_prev(&SelectPrev, window, cx),
+        }
+    }
+
     // Cycle through the available grep modes.
     fn on_cycle_grep_mode(
         &mut self,
@@ -1061,7 +1107,6 @@ impl FffPicker {
             GrepMode::Regex => GrepMode::Fuzzy,
             GrepMode::Fuzzy => GrepMode::PlainText,
         };
-        self.status_message = Some(format!("Grep mode: {:?}", self.grep_mode));
         self.run_search(cx);
     }
 
@@ -1159,6 +1204,7 @@ impl Render for FffPicker {
             }
         }
         let palette = theme::palette();
+        let theme = cx.global::<AppTheme>();
         let ui_font_family = theme::ui_font_family();
         let buffer_font_family = theme::buffer_font_family();
         let preview_line_height = px(14.0);
@@ -1196,7 +1242,7 @@ impl Render for FffPicker {
             "No preview"
         };
 
-        let status_text = if let Some(message) = self.status_message.clone() {
+        let mut status_text = if let Some(message) = self.status_message.clone() {
             message
         } else if !scan_done {
             String::new()
@@ -1206,6 +1252,17 @@ impl Render for FffPicker {
                 results.len()
             )
         };
+        if self.view == SearchView::Grep {
+            let mode = match self.grep_mode {
+                GrepMode::PlainText => "plain",
+                GrepMode::Regex => "regex",
+                GrepMode::Fuzzy => "fuzzy",
+            };
+            if !status_text.is_empty() {
+                status_text.push_str("  \u{2022}  ");
+            }
+            status_text.push_str(&format!("mode: {mode}"));
+        }
 
         div()
             .track_focus(&self.focus_handle)
@@ -1214,6 +1271,8 @@ impl Render for FffPicker {
             .on_action(cx.listener(Self::on_select_next))
             .on_action(cx.listener(Self::on_select_prev))
             .on_action(cx.listener(Self::on_toggle_selected))
+            .on_action(cx.listener(Self::on_toggle_and_advance))
+            .on_action(cx.listener(Self::on_shift_tab))
             .on_action(cx.listener(Self::on_cycle_grep_mode))
             .on_action(cx.listener(Self::on_cycle_previous_query))
             .on_action(cx.listener(Self::on_preview_scroll_up))
@@ -1261,17 +1320,64 @@ impl Render for FffPicker {
                         )
                     })
                     .when(scan_done && results.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .flex_1()
-                                .size_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_sm()
-                                .text_color(rgb(palette.text_dim))
-                                .child("No files matched"),
-                        )
+                        if self.view == SearchView::Grep && self.query.trim().is_empty() {
+                            let hint_row = |key: &'static str, desc: &'static str| {
+                                div()
+                                    .flex()
+                                    .gap(px(8.0))
+                                    .text_xs()
+                                    .text_color(rgb(theme.palette.text_dim))
+                                    .child(div().w(px(140.0)).child(key))
+                                    .child(div().child(desc))
+                            };
+                            this.child(
+                                div()
+                                    .flex_1()
+                                    .size_full()
+                                    .px(px(20.0))
+                                    .pt(px(20.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(theme.palette.text_dim))
+                                            .child("Start typing to search file contents..."),
+                                    )
+                                    .child(div().h(px(8.0)))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme.palette.text_secondary))
+                                            .child("Tips:"),
+                                    )
+                                    .child(hint_row(
+                                        "\"pattern *.rs\"",
+                                        "search only in Rust files",
+                                    ))
+                                    .child(hint_row(
+                                        "\"pattern /src/\"",
+                                        "limit search to src/ directory",
+                                    ))
+                                    .child(hint_row(
+                                        "\"!test pattern\"",
+                                        "exclude test files",
+                                    )),
+                            )
+                        } else {
+                            this.child(
+                                div()
+                                    .flex_1()
+                                    .size_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_sm()
+                                    .text_color(rgb(theme.palette.text_dim))
+                                    .child("No files matched"),
+                            )
+                        }
                     })
                     .when(scan_done && !results.is_empty(), |this| {
                         let list_panel = div()
@@ -1537,15 +1643,18 @@ impl Render for FffPicker {
                                             .items_center()
                                             .font_family(buffer_font_family.clone())
                                             .children(line.spans.iter().map(|span| {
-                                                div()
+                                                let mut element = div()
                                                     .text_xs()
                                                     .line_height(px(14.0))
                                                     .text_color(rgb(span.color))
                                                     .when(span.bold, |d| d.font_weight(FontWeight::BOLD))
                                                     .when(span.italic, |d| d.italic())
                                                     .when(span.underline, |d| d.underline())
-                                                    .when(span.strikethrough, |d| d.line_through())
-                                                    .child(span.text.clone())
+                                                    .when(span.strikethrough, |d| d.line_through());
+                                                if let Some(bg_color) = span.bg {
+                                                    element = element.bg(rgb(bg_color));
+                                                }
+                                                element.child(span.text.clone())
                                             }))
                                     })
                                     .collect()
@@ -1577,8 +1686,15 @@ impl Render for FffPicker {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(palette.text_dim))
-                            .child("\u{2191}\u{2193} navigate  \u{23CE} open  esc quit"),
+                            .text_color(rgb(theme.palette.text_dim))
+                            .child(match self.view {
+                                SearchView::Grep => {
+                                    "\u{2191}\u{2193} nav  tab toggle  \u{21E7}tab mode  \u{23CE} open  esc quit"
+                                }
+                                SearchView::Files => {
+                                    "\u{2191}\u{2193} nav  tab toggle  \u{23CE} open  esc quit"
+                                }
+                            }),
                     ),
             )
     }

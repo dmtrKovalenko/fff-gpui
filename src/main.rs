@@ -24,7 +24,8 @@ use tracing::{debug, info};
 use config::AppConfig;
 use picker::{
     CyclePreviousQuery, FffPicker, OpenSelected, PickerSharedState, PreviewScrollDown,
-    PreviewScrollUp, Quit, SelectNext, SelectPrev, SwitchFiles, SwitchGrep,
+    PreviewScrollUp, Quit, SelectNext, SelectPrev, ShiftTab, SwitchFiles, SwitchGrep,
+    ToggleSelectedAndAdvance,
 };
 use service::{ServiceCommand, forward_to_running_instance, start_listener};
 use text_field::{
@@ -43,6 +44,7 @@ struct LaunchOptions {
     background: bool,
     open_path: Option<PathBuf>,
     base_path_explicit: bool,
+    start_in_grep: bool,
 }
 
 #[derive(Clone)]
@@ -50,6 +52,7 @@ struct PickerSession {
     base_path: PathBuf,
     shared: PickerSharedState,
     enable_content_indexing: bool,
+    start_in_grep: bool,
 }
 
 struct RuntimeConfig {
@@ -60,11 +63,12 @@ struct RuntimeConfig {
 }
 
 impl PickerSession {
-    fn new(base_path: PathBuf, enable_content_indexing: bool) -> Self {
+    fn new(base_path: PathBuf, enable_content_indexing: bool, start_in_grep: bool) -> Self {
         Self {
             base_path,
             shared: PickerSharedState::default(),
             enable_content_indexing,
+            start_in_grep,
         }
     }
 }
@@ -87,11 +91,17 @@ fn parse_launch_options() -> LaunchOptions {
     let mut background = false;
     let mut base_path = None;
     let mut open_path = None;
+    let mut start_in_grep = false;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
         if arg == "-d" || arg == "--daemon" {
             background = true;
+            continue;
+        }
+
+        if arg == "--grep" {
+            start_in_grep = true;
             continue;
         }
 
@@ -102,10 +112,10 @@ fn parse_launch_options() -> LaunchOptions {
             continue;
         }
 
-        if base_path.is_none() {
-            if let Some(path) = normalize_dir(PathBuf::from(arg)) {
-                base_path = Some(path);
-            }
+        if base_path.is_none()
+            && let Some(path) = normalize_dir(PathBuf::from(arg))
+        {
+            base_path = Some(path);
         }
     }
 
@@ -114,6 +124,7 @@ fn parse_launch_options() -> LaunchOptions {
         background,
         open_path,
         base_path_explicit: base_path.is_some(),
+        start_in_grep,
     }
 }
 
@@ -138,8 +149,8 @@ fn bind_base_keys(cx: &mut App) {
         KeyBinding::new("return", OpenSelected, None),
         KeyBinding::new("up", SelectPrev, None),
         KeyBinding::new("down", SelectNext, None),
-        KeyBinding::new("tab", SelectNext, None),
-        KeyBinding::new("shift-tab", SelectPrev, None),
+        KeyBinding::new("tab", ToggleSelectedAndAdvance, None),
+        KeyBinding::new("shift-tab", ShiftTab, None),
         KeyBinding::new("ctrl-up", CyclePreviousQuery, None),
         KeyBinding::new("ctrl-u", PreviewScrollUp, None),
         KeyBinding::new("ctrl-d", PreviewScrollDown, None),
@@ -264,6 +275,7 @@ fn open_window(session: PickerSession, runtime_config: &Arc<Mutex<RuntimeConfig>
     let base_path = session.base_path;
     let shared = session.shared;
     let enable_content_indexing = session.enable_content_indexing;
+    let start_in_grep = session.start_in_grep;
     let window_width = config.window_width;
     let window_height = config.window_height;
     let bounds = cx
@@ -296,6 +308,7 @@ fn open_window(session: PickerSession, runtime_config: &Arc<Mutex<RuntimeConfig>
                     base_path.clone(),
                     shared.clone(),
                     enable_content_indexing,
+                    start_in_grep,
                     cx,
                 )
             });
@@ -331,7 +344,6 @@ fn toggle_picker(
     } else {
         info!("closing picker window(s)");
         close_all_windows(cx);
-        return;
     }
 }
 
@@ -339,23 +351,26 @@ fn snapshot_session(session: &Arc<Mutex<PickerSession>>) -> PickerSession {
     session
         .lock()
         .map(|session| session.clone())
-        .unwrap_or_else(|_| PickerSession::new(home_dir(), false))
+        .unwrap_or_else(|_| PickerSession::new(home_dir(), false, false))
 }
 
 fn one_shot_session(
     path: PathBuf,
     sessions: &Arc<Mutex<HashMap<PathBuf, PickerSession>>>,
+    start_in_grep: bool,
 ) -> PickerSession {
     let fallback_path = path.clone();
-    sessions
+    let mut session = sessions
         .lock()
         .map(|mut sessions| {
             sessions
                 .entry(path.clone())
-                .or_insert_with(|| PickerSession::new(path, true))
+                .or_insert_with(|| PickerSession::new(path, true, start_in_grep))
                 .clone()
         })
-        .unwrap_or_else(|_| PickerSession::new(fallback_path, true))
+        .unwrap_or_else(|_| PickerSession::new(fallback_path, true, start_in_grep));
+    session.start_in_grep = start_in_grep;
+    session
 }
 
 fn show_or_focus_picker(
@@ -386,17 +401,19 @@ fn handle_service_command(
             debug!("received toggle-window service command");
             toggle_picker(session, runtime_config, cx)
         }
-        ServiceCommand::OpenPath(path) => {
-            debug!(path = %path.display(), "received open-path service command");
+        ServiceCommand::OpenPath { path, in_grep } => {
+            debug!(path = %path.display(), in_grep, "received open-path service command");
             let (should_replace, session_snapshot) = match session.lock() {
                 Ok(mut current) => {
                     let changed = current.base_path != path;
                     if changed {
-                        *current = PickerSession::new(path.clone(), true);
+                        *current = PickerSession::new(path.clone(), true, in_grep);
+                    } else {
+                        current.start_in_grep = in_grep;
                     }
                     (changed, current.clone())
                 }
-                Err(_) => (true, PickerSession::new(path.clone(), true)),
+                Err(_) => (true, PickerSession::new(path.clone(), true, in_grep)),
             };
 
             if cx.windows().is_empty() {
@@ -406,10 +423,10 @@ fn handle_service_command(
                 open_window(session_snapshot, runtime_config, cx);
             }
         }
-        ServiceCommand::OpenOneShot(path) => {
-            debug!(path = %path.display(), "received one-shot open service command");
+        ServiceCommand::OpenOneShot { path, in_grep } => {
+            debug!(path = %path.display(), in_grep, "received one-shot open service command");
             open_window(
-                one_shot_session(path, one_shot_sessions),
+                one_shot_session(path, one_shot_sessions, in_grep),
                 runtime_config,
                 cx,
             );
@@ -425,19 +442,17 @@ fn handle_service_command(
     }
 }
 
-fn drive_service_commands(
+async fn drive_service_commands(
     rx: async_channel::Receiver<ServiceCommand>,
     session: Arc<Mutex<PickerSession>>,
     one_shot_sessions: Arc<Mutex<HashMap<PathBuf, PickerSession>>>,
     runtime_config: Arc<Mutex<RuntimeConfig>>,
     app: AsyncApp,
-) -> impl std::future::Future<Output = ()> {
-    async move {
-        while let Ok(command) = rx.recv().await {
-            let _ = app.update(|app| {
-                handle_service_command(command, &session, &one_shot_sessions, &runtime_config, app)
-            });
-        }
+) {
+    while let Ok(command) = rx.recv().await {
+        let _ = app.update(|app| {
+            handle_service_command(command, &session, &one_shot_sessions, &runtime_config, app)
+        });
     }
 }
 
@@ -450,6 +465,7 @@ fn main() {
     let picker_session = Arc::new(Mutex::new(PickerSession::new(
         base_path.clone(),
         launch.base_path_explicit,
+        launch.start_in_grep,
     )));
     let one_shot_sessions = Arc::new(Mutex::new(HashMap::new()));
     let loaded_config = match config::load_active_config() {
@@ -492,11 +508,16 @@ fn main() {
         "startup environment"
     );
 
-    let forward_command = launch
-        .open_path
-        .clone()
-        .map(ServiceCommand::OpenOneShot)
-        .unwrap_or_else(|| ServiceCommand::OpenPath(base_path.clone()));
+    let forward_command = match launch.open_path.clone() {
+        Some(path) => ServiceCommand::OpenOneShot {
+            path,
+            in_grep: launch.start_in_grep,
+        },
+        None => ServiceCommand::OpenPath {
+            path: base_path.clone(),
+            in_grep: launch.start_in_grep,
+        },
+    };
 
     if forward_to_running_instance(&forward_command)
         .expect("failed to forward launch request to existing service")
@@ -547,7 +568,7 @@ fn main() {
         .detach();
         if let Some(path) = launch.open_path.clone() {
             open_window(
-                one_shot_session(path, &one_shot_sessions),
+                one_shot_session(path, &one_shot_sessions, launch.start_in_grep),
                 &runtime_config,
                 cx,
             );

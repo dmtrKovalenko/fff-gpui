@@ -21,20 +21,36 @@ This is the recommended way to use fff-gpui. Add the following to your Zed confi
 
 **`~/.config/zed/tasks.json`**
 ```json
-{
-  "label": "Open fff-gpui",
-  "command": "/path/to/fff-gpui --open .",
-  "env": { "EDITOR": "zed" },
-  "use_new_terminal": false,
-  "allow_concurrent_runs": false,
-  "reveal": "never",
-  "reveal_target": "dock",
-  "hide": "always",
-  "shell": "system",
-  "show_summary": false,
-  "show_command": false,
-  "save": "none"
-}
+[
+  {
+    "label": "fff-gpui: Files",
+    "command": "/path/to/fff-gpui --open .",
+    "env": { "EDITOR": "zed" },
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "never",
+    "reveal_target": "dock",
+    "hide": "always",
+    "shell": "system",
+    "show_summary": false,
+    "show_command": false,
+    "save": "none"
+  },
+  {
+    "label": "fff-gpui: Grep",
+    "command": "/path/to/fff-gpui --open . --grep",
+    "env": { "EDITOR": "zed" },
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "never",
+    "reveal_target": "dock",
+    "hide": "always",
+    "shell": "system",
+    "show_summary": false,
+    "show_command": false,
+    "save": "none"
+  }
+]
 ```
 
 **`~/.config/zed/keymap.json`**
@@ -42,14 +58,13 @@ This is the recommended way to use fff-gpui. Add the following to your Zed confi
 {
   "context": "Workspace",
   "bindings": {
-    "cmd-p": [
-      "task::Spawn", 
-      { "task_name": "Open fff-gpui" }]
+    "cmd-k cmd-p": ["task::Spawn", { "task_name": "fff-gpui: Files" }],
+    "cmd-k cmd-f": ["task::Spawn", { "task_name": "fff-gpui: Grep" }]
   }
 }
 ```
 
-This opens fff-gpui scoped to the current project root. Selected files open directly in Zed.
+This opens fff-gpui scoped to the current project root. `cmd-k cmd-p` launches in file-search mode, `cmd-k cmd-f` launches directly in grep mode. Selected files open in Zed; with grep, the editor jumps to the matched line.
 
 ## Installation
 

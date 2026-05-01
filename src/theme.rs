@@ -7,7 +7,7 @@ use std::sync::{
 };
 
 use anyhow::{Context as _, Result};
-use gpui::{App, SharedString, WindowAppearance};
+use gpui::{App, Global, SharedString, WindowAppearance};
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -27,7 +27,7 @@ const DEFAULT_PREVIEW_BG: u32 = 0x161618;
 const DEFAULT_UI_FONT_FAMILY: &str = ".ZedSans";
 const DEFAULT_BUFFER_FONT_FAMILY: &str = ".ZedMono";
 
-static ACTIVE_THEME: OnceLock<RwLock<ResolvedTheme>> = OnceLock::new();
+static ACTIVE_THEME: OnceLock<RwLock<AppTheme>> = OnceLock::new();
 static THEME_VERSION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,11 +41,12 @@ pub struct Palette {
     pub text_dim: u32,
     pub status_bar_bg: u32,
     pub match_highlight: u32,
+    pub match_highlight_bg: u32,
     pub preview_bg: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedTheme {
+pub struct AppTheme {
     pub palette: Palette,
     pub ui_font_family: SharedString,
     pub buffer_font_family: SharedString,
@@ -74,12 +75,13 @@ impl Default for Palette {
             text_dim: DEFAULT_TEXT_DIM,
             status_bar_bg: DEFAULT_STATUS_BAR_BG,
             match_highlight: DEFAULT_MATCH_HIGHLIGHT,
+            match_highlight_bg: 0x2C4870,
             preview_bg: DEFAULT_PREVIEW_BG,
         }
     }
 }
 
-impl Default for ResolvedTheme {
+impl Default for AppTheme {
     fn default() -> Self {
         Self {
             palette: Palette::default(),
@@ -91,7 +93,9 @@ impl Default for ResolvedTheme {
     }
 }
 
-impl ResolvedTheme {
+impl Global for AppTheme {}
+
+impl AppTheme {
     fn syntax_color(&self, capture_name: &str) -> u32 {
         if syntax_capture_is_punctuation(capture_name) {
             return self.syntax_default_color;
@@ -207,14 +211,14 @@ fn normalize_name(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
-fn active_theme_lock() -> &'static RwLock<ResolvedTheme> {
-    ACTIVE_THEME.get_or_init(|| RwLock::new(ResolvedTheme::default()))
+fn active_theme_lock() -> &'static RwLock<AppTheme> {
+    ACTIVE_THEME.get_or_init(|| RwLock::new(AppTheme::default()))
 }
 
-pub fn current() -> ResolvedTheme {
+pub fn current() -> AppTheme {
     match active_theme_lock().read() {
         Ok(theme) => theme.clone(),
-        Err(_) => ResolvedTheme::default(),
+        Err(_) => AppTheme::default(),
     }
 }
 
@@ -263,13 +267,14 @@ pub fn sync_from_config(config: &AppConfig, appearance: WindowAppearance, cx: &m
             Ok(theme) => theme,
             Err(err) => {
                 warn!(error = %err, "failed to sync Zed theme settings; falling back to defaults");
-                ResolvedTheme::default()
+                AppTheme::default()
             }
         }
     } else {
-        ResolvedTheme::default()
+        AppTheme::default()
     };
 
+    cx.set_global(resolved.clone());
     if let Ok(mut guard) = active_theme_lock().write() {
         *guard = resolved;
     }
@@ -343,7 +348,7 @@ fn load_zed_settings() -> Result<ZedSettings> {
     read_json(&path)
 }
 
-fn resolve_from_zed_settings(appearance: WindowAppearance) -> Result<ResolvedTheme> {
+fn resolve_from_zed_settings(appearance: WindowAppearance) -> Result<AppTheme> {
     let settings = load_zed_settings()?;
     let catalog = load_theme_catalog()?;
     let ui_font_family = SharedString::from(
@@ -364,7 +369,7 @@ fn resolve_from_zed_settings(appearance: WindowAppearance) -> Result<ResolvedThe
     Ok(match resolved_name {
         Some(name) => match catalog.get(&normalize_name(&name)).cloned() {
             Some(entry) => {
-                ResolvedTheme {
+                AppTheme {
                     palette: entry.palette,
                     ui_font_family,
                     buffer_font_family,
@@ -374,10 +379,10 @@ fn resolve_from_zed_settings(appearance: WindowAppearance) -> Result<ResolvedThe
             }
             None => {
                 warn!(theme = %name, "Zed theme not found; using built-in fallback theme");
-                ResolvedTheme {
+                AppTheme {
                     ui_font_family,
                     buffer_font_family,
-                    ..ResolvedTheme::default()
+                    ..AppTheme::default()
                 }
             }
         },
@@ -386,10 +391,10 @@ fn resolve_from_zed_settings(appearance: WindowAppearance) -> Result<ResolvedThe
                 settings_path = %zed_settings_path().display(),
                 "no Zed theme configured; using built-in fallback theme"
             );
-            ResolvedTheme {
+            AppTheme {
                 ui_font_family,
                 buffer_font_family,
-                ..ResolvedTheme::default()
+                ..AppTheme::default()
             }
         }
     })
@@ -529,6 +534,9 @@ fn palette_from_style(style: &Value) -> Palette {
             .or_else(|| color_from_style(style, "search.active_match_background"))
             .or_else(|| color_from_style(style, "text.accent"))
             .unwrap_or(DEFAULT_MATCH_HIGHLIGHT),
+        match_highlight_bg: color_from_style(style, "search.match_background")
+            .or_else(|| color_from_style(style, "search.active_match_background"))
+            .unwrap_or(0x2C4870),
         preview_bg: color_from_style(style, "editor.background")
             .or_else(|| color_from_style(style, "surface.background"))
             .unwrap_or(DEFAULT_PREVIEW_BG),
@@ -737,7 +745,7 @@ mod tests {
 
     #[test]
     fn constant_and_punctuation_captures_follow_variable_and_text_colors() {
-        let theme = ResolvedTheme {
+        let theme = AppTheme {
             syntax_styles: vec![
                 ("variable".to_string(), syntax_style(0x112233)),
                 ("constant".to_string(), syntax_style(0x445566)),
@@ -745,7 +753,7 @@ mod tests {
                 ("punctuation".to_string(), syntax_style(0xaabbcc)),
             ],
             syntax_default_color: 0xddeeff,
-            ..ResolvedTheme::default()
+            ..AppTheme::default()
         };
 
         assert_eq!(theme.syntax_color("constant"), 0x112233);

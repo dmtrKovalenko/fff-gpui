@@ -7,6 +7,7 @@ use tracing::{info, warn};
 
 pub const DEFAULT_WINDOW_WIDTH: f32 = 960.0;
 pub const DEFAULT_WINDOW_HEIGHT: f32 = 520.0;
+pub const DEFAULT_PICKER_PANE_WIDTH: f32 = 430.0;
 
 fn default_window_width() -> f32 {
     DEFAULT_WINDOW_WIDTH
@@ -14,6 +15,52 @@ fn default_window_width() -> f32 {
 
 fn default_window_height() -> f32 {
     DEFAULT_WINDOW_HEIGHT
+}
+
+fn default_picker_pane_width() -> f32 {
+    DEFAULT_PICKER_PANE_WIDTH
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FontConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ThemeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_row: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hover_row: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_primary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_secondary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_dim: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_bar_bg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_highlight: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_highlight_bg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_bg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_bg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_selection: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +76,12 @@ pub struct AppConfig {
     pub window_width: f32,
     #[serde(default = "default_window_height")]
     pub window_height: f32,
+    #[serde(default = "default_picker_pane_width")]
+    pub picker_pane_width: f32,
+    #[serde(default)]
+    pub font: FontConfig,
+    #[serde(default)]
+    pub theme: ThemeConfig,
 }
 
 impl Default for AppConfig {
@@ -39,6 +92,9 @@ impl Default for AppConfig {
             global_keybind: None,
             window_width: DEFAULT_WINDOW_WIDTH,
             window_height: DEFAULT_WINDOW_HEIGHT,
+            picker_pane_width: DEFAULT_PICKER_PANE_WIDTH,
+            font: FontConfig::default(),
+            theme: ThemeConfig::default(),
         }
     }
 }
