@@ -1677,11 +1677,22 @@ name = "fff-gpui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
+ "cocoa 0.26.0",
+ "fff-grep",
+ "fff-query-parser",
  "fff-search",
+ "global-hotkey",
  "gpui",
  "mimalloc",
+ "notify",
+ "objc",
+ "serde",
  "smol",
  "syntect",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
  "two-face",
  "unicode-segmentation",
 ]
@@ -2164,6 +2175,23 @@ name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
+name = "global-hotkey"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c386b0a4a70cb2d39fffd74480f985b6f0bfbcb934b6a6b6b7e630e448f242e"
+dependencies = [
+ "crossbeam-channel",
+ "keyboard-types",
+ "objc2",
+ "objc2-app-kit",
+ "once_cell",
+ "thiserror 2.0.18",
+ "windows-sys 0.59.0",
+ "x11rb",
+ "xkeysym",
+]
 
 [[package]]
 name = "globset"
@@ -3098,6 +3126,17 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "keyboard-types"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b750dcadc39a09dbadd74e118f6dd6598df77fa01df0cfcdc52c28dece74528a"
+dependencies = [
+ "bitflags 2.11.1",
+ "serde",
+ "unicode-segmentation",
 ]
 
 [[package]]

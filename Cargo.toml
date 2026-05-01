@@ -5,13 +5,26 @@ edition = "2024"
 
 [dependencies]
 gpui = { version = "*" }
-fff-search = { version = "0.6", features = ["zlob"]}
+fff-search = { version = "0.6", features = ["zlob"] }
+fff-query-parser = { version = "0.6", features = ["zlob"] }
+fff-grep = { version = "0.6" }
 smol = "2"
 unicode-segmentation = "1"
 anyhow = "1"
+async-channel = "2"
+global-hotkey = "0.8.0"
+notify = "9.0.0-rc.3"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 syntect = "5"
 mimalloc = "0.1"
 two-face = "0.5.1"
+objc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
 
 [profile.dev.package."*"]
 opt-level = 3
