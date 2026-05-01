@@ -4,7 +4,7 @@ A fast, keyboard-driven file finder for macOS built on [GPUI](https://github.com
 
 Under the hood it uses [fff](https://crates.io/crates/fff-search) for fuzzy file search and grep, with frecency-based ranking so the files you actually use rise to the top.
 
-> **Screenshot coming soon**
+<img width="1072" height="633" alt="Screenshot 2026-05-01 at 4 44 15 PM" src="https://github.com/user-attachments/assets/4ad54fdc-5f0b-4ecf-908e-1bc3fe27f4ae" />
 
 ## Features
 
