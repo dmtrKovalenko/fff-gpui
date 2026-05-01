@@ -37,9 +37,6 @@ actions!(fff_gpui, [ToggleWindow, OpenConfig]);
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const WINDOW_WIDTH: f32 = 960.0;
-const WINDOW_HEIGHT: f32 = 520.0;
-
 #[derive(Debug, Clone)]
 struct LaunchOptions {
     base_path: PathBuf,
@@ -257,26 +254,32 @@ fn open_config_file(runtime: &Arc<Mutex<RuntimeConfig>>) {
 }
 
 // Open the main picker window centered on the primary display.
-fn open_window(session: PickerSession, config: &AppConfig, cx: &mut App) {
-    theme::sync_from_config(config, cx.window_appearance(), cx);
+fn open_window(session: PickerSession, runtime_config: &Arc<Mutex<RuntimeConfig>>, cx: &mut App) {
+    let config = runtime_config
+        .lock()
+        .map(|state| state.config.clone())
+        .unwrap_or_default();
+    theme::sync_from_config(&config, cx.window_appearance(), cx);
 
     let base_path = session.base_path;
     let shared = session.shared;
     let enable_content_indexing = session.enable_content_indexing;
+    let window_width = config.window_width;
+    let window_height = config.window_height;
     let bounds = cx
         .primary_display()
         .map(|d| {
             let db = d.bounds();
-            let x = db.origin.x + (db.size.width - px(WINDOW_WIDTH)) / 2.0;
-            let y = db.origin.y + (db.size.height - px(WINDOW_HEIGHT)) / 3.0;
+            let x = db.origin.x + (db.size.width - px(window_width)) / 2.0;
+            let y = db.origin.y + (db.size.height - px(window_height)) / 3.0;
             Bounds {
                 origin: point(x, y),
-                size: size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)),
+                size: size(px(window_width), px(window_height)),
             }
         })
         .unwrap_or(Bounds {
             origin: point(px(400.0), px(200.0)),
-            size: size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)),
+            size: size(px(window_width), px(window_height)),
         });
 
     cx.open_window(
@@ -323,12 +326,8 @@ fn toggle_picker(
 ) {
     if cx.windows().is_empty() {
         let session = snapshot_session(session);
-        let config = runtime_config
-            .lock()
-            .map(|state| state.config.clone())
-            .unwrap_or_default();
         info!(base_path = %session.base_path.display(), "opening picker window");
-        open_window(session, &config, cx);
+        open_window(session, runtime_config, cx);
     } else {
         info!("closing picker window(s)");
         close_all_windows(cx);
@@ -366,12 +365,8 @@ fn show_or_focus_picker(
 ) {
     if cx.windows().is_empty() {
         let session = snapshot_session(session);
-        let config = runtime_config
-            .lock()
-            .map(|state| state.config.clone())
-            .unwrap_or_default();
         info!(base_path = %session.base_path.display(), "reopening picker window");
-        open_window(session, &config, cx);
+        open_window(session, runtime_config, cx);
     }
 }
 
@@ -405,27 +400,19 @@ fn handle_service_command(
             };
 
             if cx.windows().is_empty() {
-                let config = runtime_config
-                    .lock()
-                    .map(|state| state.config.clone())
-                    .unwrap_or_default();
-                open_window(session_snapshot, &config, cx);
+                open_window(session_snapshot, runtime_config, cx);
             } else if should_replace {
                 close_all_windows(cx);
-                let config = runtime_config
-                    .lock()
-                    .map(|state| state.config.clone())
-                    .unwrap_or_default();
-                open_window(session_snapshot, &config, cx);
+                open_window(session_snapshot, runtime_config, cx);
             }
         }
         ServiceCommand::OpenOneShot(path) => {
             debug!(path = %path.display(), "received one-shot open service command");
-            let config = runtime_config
-                .lock()
-                .map(|state| state.config.clone())
-                .unwrap_or_default();
-            open_window(one_shot_session(path, one_shot_sessions), &config, cx);
+            open_window(
+                one_shot_session(path, one_shot_sessions),
+                runtime_config,
+                cx,
+            );
         }
         ServiceCommand::OpenConfig => {
             debug!("received open-config service command");
@@ -559,11 +546,11 @@ fn main() {
         })
         .detach();
         if let Some(path) = launch.open_path.clone() {
-            let config = runtime_config
-                .lock()
-                .map(|state| state.config.clone())
-                .unwrap_or_default();
-            open_window(one_shot_session(path, &one_shot_sessions), &config, cx);
+            open_window(
+                one_shot_session(path, &one_shot_sessions),
+                &runtime_config,
+                cx,
+            );
         } else {
             info!("launching without initial picker window");
         }

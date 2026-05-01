@@ -3,7 +3,18 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
+
+pub const DEFAULT_WINDOW_WIDTH: f32 = 960.0;
+pub const DEFAULT_WINDOW_HEIGHT: f32 = 520.0;
+
+fn default_window_width() -> f32 {
+    DEFAULT_WINDOW_WIDTH
+}
+
+fn default_window_height() -> f32 {
+    DEFAULT_WINDOW_HEIGHT
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -14,6 +25,10 @@ pub struct AppConfig {
     pub sync_zed_settings: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub global_keybind: Option<String>,
+    #[serde(default = "default_window_width")]
+    pub window_width: f32,
+    #[serde(default = "default_window_height")]
+    pub window_height: f32,
 }
 
 impl Default for AppConfig {
@@ -22,6 +37,8 @@ impl Default for AppConfig {
             launch_at_login: true,
             sync_zed_settings: true,
             global_keybind: None,
+            window_width: DEFAULT_WINDOW_WIDTH,
+            window_height: DEFAULT_WINDOW_HEIGHT,
         }
     }
 }
@@ -99,6 +116,20 @@ pub fn load_config_from(path: &Path) -> Result<LoadedConfig> {
         .is_some_and(|binding| binding.trim().is_empty())
     {
         config.global_keybind = None;
+    }
+    if !config.window_width.is_finite() || config.window_width <= 0.0 {
+        warn!(
+            value = config.window_width,
+            "invalid window_width in config; falling back to default"
+        );
+        config.window_width = DEFAULT_WINDOW_WIDTH;
+    }
+    if !config.window_height.is_finite() || config.window_height <= 0.0 {
+        warn!(
+            value = config.window_height,
+            "invalid window_height in config; falling back to default"
+        );
+        config.window_height = DEFAULT_WINDOW_HEIGHT;
     }
     Ok(LoadedConfig {
         path: path.to_path_buf(),
