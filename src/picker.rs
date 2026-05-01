@@ -79,6 +79,7 @@ pub struct FileItemSnapshot {
     pub dir: String,
     pub absolute_path: PathBuf,
     pub git_status: Option<String>,
+    pub frecency_score: i16,
     pub match_ranges: Vec<Range<usize>>,
     pub grep_matches: Vec<GrepMatchLine>,
 }
@@ -87,6 +88,7 @@ pub struct FffPicker {
     shared_picker: SharedPicker,
     shared_frecency: SharedFrecency,
     shared_query_tracker: SharedQueryTracker,
+    base_path: PathBuf,
     view: SearchView,
     grep_mode: GrepMode,
     query: String,
@@ -156,9 +158,7 @@ fn find_match_ranges(query: &str, text: &str) -> Vec<Range<usize>> {
 }
 
 // Render text with character ranges highlighted in the match color.
-fn render_highlighted(text: &str, ranges: &[Range<usize>]) -> Div {
-    let palette = theme::palette();
-
+fn render_highlighted(text: &str, ranges: &[Range<usize>], theme: &AppTheme) -> Div {
     fn clamp_range_to_char_boundaries(
         text: &str,
         start: usize,
@@ -197,13 +197,13 @@ fn render_highlighted(text: &str, ranges: &[Range<usize>]) -> Div {
         if range.start > last {
             parts.push(
                 div()
-                    .text_color(rgb(palette.text_primary))
+                    .text_color(rgb(theme.text_primary))
                     .child(text[last..range.start].to_string()),
             );
         }
         parts.push(
             div()
-                .text_color(rgb(palette.match_highlight))
+                .text_color(rgb(theme.match_highlight))
                 .child(text[range.clone()].to_string()),
         );
         last = range.end;
@@ -211,7 +211,7 @@ fn render_highlighted(text: &str, ranges: &[Range<usize>]) -> Div {
     if last < text.len() {
         parts.push(
             div()
-                .text_color(rgb(palette.text_primary))
+                .text_color(rgb(theme.text_primary))
                 .child(text[last..].to_string()),
         );
     }
@@ -245,17 +245,17 @@ fn should_allow_fuzzy_fallback(query: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
-// Format a git status badge for a row.
-fn git_status_badge(status: Option<&str>) -> Option<(&'static str, u32)> {
+// Resolve the git-status colour used for the row's left-edge bar.
+fn git_status_bar_color(status: Option<&str>) -> Option<u32> {
     match status {
-        Some("modified") => Some(("M", 0xF5A524)),
-        Some("staged_new") | Some("staged_modified") => Some(("A", 0x32D583)),
-        Some("staged_deleted") | Some("deleted") => Some(("D", 0xF97066)),
-        Some("renamed") => Some(("R", 0x8E8E93)),
-        Some("untracked") => Some(("?", 0xA48EFF)),
-        Some("ignored") => Some(("I", 0x6C6C70)),
+        Some("modified") => Some(0xF5A524),
+        Some("staged_new") | Some("staged_modified") => Some(0x32D583),
+        Some("staged_deleted") | Some("deleted") => Some(0xF97066),
+        Some("renamed") => Some(0x8E8E93),
+        Some("untracked") => Some(0xA48EFF),
+        Some("ignored") => Some(0x6C6C70),
         Some("clean") | None => None,
-        Some(_) => Some(("?", 0x6C6C70)),
+        Some(_) => Some(0x6C6C70),
     }
 }
 
@@ -322,6 +322,7 @@ fn execute_grep_search(
             item_by_path.insert(absolute_path.clone(), items.len());
             items.push(FileItemSnapshot {
                 git_status: format_git_status_opt(fi.git_status).map(str::to_string),
+                frecency_score: fi.access_frecency_score,
                 match_ranges: find_match_ranges(query, &file_name),
                 file_name,
                 dir,
@@ -363,6 +364,7 @@ impl FffPicker {
             shared_picker: shared.shared_picker,
             shared_frecency: shared.shared_frecency,
             shared_query_tracker: shared.shared_query_tracker,
+            base_path: base_path.clone(),
             view: if start_in_grep {
                 SearchView::Grep
             } else {
@@ -628,6 +630,7 @@ impl FffPicker {
                                     FileItemSnapshot {
                                         git_status: format_git_status_opt(fi.git_status)
                                             .map(str::to_string),
+                                        frecency_score: fi.access_frecency_score,
                                         match_ranges: find_match_ranges(&query, &file_name),
                                         file_name,
                                         dir,
@@ -687,6 +690,7 @@ impl FffPicker {
                                     items.push(FileItemSnapshot {
                                         git_status: format_git_status_opt(fi.git_status)
                                             .map(str::to_string),
+                                        frecency_score: fi.access_frecency_score,
                                         match_ranges: find_match_ranges(&query, &file_name),
                                         file_name,
                                         dir,
@@ -777,6 +781,7 @@ impl FffPicker {
                                 merged.push(FileItemSnapshot {
                                     git_status: format_git_status_opt(fi.git_status)
                                         .map(str::to_string),
+                                    frecency_score: fi.access_frecency_score,
                                     match_ranges: find_match_ranges(&query, &file_name),
                                     file_name,
                                     dir,
@@ -819,6 +824,12 @@ impl FffPicker {
                     this.preview_scroll_row = 0;
                     this.selected_paths
                         .retain(|path| this.results.iter().any(|item| &item.absolute_path == path));
+                    if !this.results.is_empty() {
+                        this.list_scroll.scroll_to_item(
+                            this.visual_index(this.selected),
+                            ScrollStrategy::Bottom,
+                        );
+                    }
                     this.load_preview(cx);
                     cx.notify();
                     this.finish_search(cx);
@@ -880,8 +891,8 @@ impl FffPicker {
         );
         let first_match_line = grep_matches.iter().map(|m| m.line_number as usize).min();
         let theme = cx.global::<AppTheme>();
-        let match_highlight = theme.palette.match_highlight;
-        let match_bg = theme.palette.match_highlight_bg;
+        let match_highlight = theme.match_highlight;
+        let match_bg = theme.match_highlight_bg;
 
         cx.spawn(
             async move |this: WeakEntity<FffPicker>, cx: &mut AsyncApp| {
@@ -1017,26 +1028,32 @@ impl FffPicker {
         window.remove_window();
     }
 
-    // Move selection down one row.
+    // Move selection visually down toward the input — i.e. toward a better-ranked result.
     fn on_select_next(&mut self, _: &SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.results.is_empty() {
-            self.selected = (self.selected + 1).min(self.results.len() - 1);
+        if !self.results.is_empty() && self.selected > 0 {
+            self.selected -= 1;
             self.list_scroll
-                .scroll_to_item(self.selected, ScrollStrategy::Center);
+                .scroll_to_item(self.visual_index(self.selected), ScrollStrategy::Center);
             self.load_preview(cx);
             cx.notify();
         }
     }
 
-    // Move selection up one row.
+    // Move selection visually up — toward a worse-ranked result.
     fn on_select_prev(&mut self, _: &SelectPrev, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected > 0 {
-            self.selected -= 1;
+        if !self.results.is_empty() && self.selected + 1 < self.results.len() {
+            self.selected += 1;
             self.list_scroll
-                .scroll_to_item(self.selected, ScrollStrategy::Center);
+                .scroll_to_item(self.visual_index(self.selected), ScrollStrategy::Center);
             self.load_preview(cx);
             cx.notify();
         }
+    }
+
+    // Translate a result index to a visual list index. The list renders bottom-up,
+    // so rank 0 (best match) sits at the bottom, just above the input.
+    fn visual_index(&self, data_index: usize) -> usize {
+        self.results.len().saturating_sub(1).saturating_sub(data_index)
     }
 
     // Select the clicked row and refresh the preview.
@@ -1052,7 +1069,7 @@ impl FffPicker {
 
         self.selected = index;
         self.list_scroll
-            .scroll_to_item(self.selected, ScrollStrategy::Center);
+            .scroll_to_item(self.visual_index(self.selected), ScrollStrategy::Center);
         self.load_preview(cx);
         window.focus(&self.text_field_focus_handle(cx));
         cx.notify();
@@ -1203,10 +1220,12 @@ impl Render for FffPicker {
                 self.load_preview(cx);
             }
         }
-        let palette = theme::palette();
-        let theme = cx.global::<AppTheme>();
-        let ui_font_family = theme::ui_font_family();
-        let buffer_font_family = theme::buffer_font_family();
+        let theme = cx.global::<AppTheme>().clone();
+        let font_family = theme.font_family.clone();
+        let buffer_font_family = theme
+            .buffer_font_family
+            .clone()
+            .or_else(|| theme.font_family.clone());
         let preview_line_height = px(14.0);
         let results = self.results.clone();
         let preview_lines = self.preview_lines.clone();
@@ -1219,6 +1238,12 @@ impl Render for FffPicker {
         let list_scroll = self.list_scroll.clone();
         let preview_scroll = self.preview_scroll.clone();
         let selected_path = results.get(selected).map(|item| item.absolute_path.clone());
+        let preview_header_path = selected_path.as_ref().map(|path| {
+            path.strip_prefix(&self.base_path)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned()
+        });
         trace!(
             scan_done,
             results = results.len(),
@@ -1282,9 +1307,9 @@ impl Render for FffPicker {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(palette.bg))
-            .text_color(rgb(palette.text_primary))
-            .font_family(ui_font_family.clone())
+            .bg(rgb(theme.bg))
+            .text_color(rgb(theme.text_primary))
+            .when_some(font_family.clone(), |this, family| this.font_family(family))
             .child(
                 div()
                     .flex_1()
@@ -1294,7 +1319,7 @@ impl Render for FffPicker {
                     .overflow_hidden()
                     .child(
                         div()
-                            .w(px(430.0))
+                            .w(px(theme.picker_pane_width))
                             .h_full()
                             .flex()
                             .flex_col()
@@ -1315,7 +1340,7 @@ impl Render for FffPicker {
                                 .items_center()
                                 .justify_center()
                                 .text_sm()
-                                .text_color(rgb(palette.text_dim))
+                                .text_color(rgb(theme.text_dim))
                                 .child("Indexing\u{2026}"),
                         )
                     })
@@ -1326,7 +1351,7 @@ impl Render for FffPicker {
                                     .flex()
                                     .gap(px(8.0))
                                     .text_xs()
-                                    .text_color(rgb(theme.palette.text_dim))
+                                    .text_color(rgb(theme.text_dim))
                                     .child(div().w(px(140.0)).child(key))
                                     .child(div().child(desc))
                             };
@@ -1342,14 +1367,14 @@ impl Render for FffPicker {
                                     .child(
                                         div()
                                             .text_sm()
-                                            .text_color(rgb(theme.palette.text_dim))
+                                            .text_color(rgb(theme.text_dim))
                                             .child("Start typing to search file contents..."),
                                     )
                                     .child(div().h(px(8.0)))
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(rgb(theme.palette.text_secondary))
+                                            .text_color(rgb(theme.text_secondary))
                                             .child("Tips:"),
                                     )
                                     .child(hint_row(
@@ -1374,13 +1399,16 @@ impl Render for FffPicker {
                                     .items_center()
                                     .justify_center()
                                     .text_sm()
-                                    .text_color(rgb(theme.palette.text_dim))
+                                    .text_color(rgb(theme.text_dim))
                                     .child("No files matched"),
                             )
                         }
                     })
-                    .when(scan_done && !results.is_empty(), |this| {
-                        let list_panel = div()
+                    .when(scan_done && !results.is_empty(), {
+                        let row_theme = theme.clone();
+                        move |this| {
+                            let theme = row_theme.clone();
+                            let list_panel = div()
                             .w_full()
                             .h_full()
                             .flex()
@@ -1391,14 +1419,35 @@ impl Render for FffPicker {
                                     "results",
                                     results.len(),
                                     cx.processor(move |_this, range: std::ops::Range<usize>, _window, cx| {
+                                        let total = results.len();
                                         range
-                                            .map(|i| {
+                                            .map(|visual_i| {
+                                                // List renders bottom-up: rank 0 sits at the
+                                                // visual bottom, just above the input.
+                                                let i = total - 1 - visual_i;
                                                 let item = &results[i];
                                                 let is_selected = i == selected;
                                                 let is_marked = selected_paths.contains(&item.absolute_path);
-                                                let display_dir = shorten_dir_for_row(&item.dir, 30);
-                                                let git_badge =
-                                                    git_status_badge(item.git_status.as_deref());
+                                                let badge_color = if is_selected {
+                                                    theme.text_primary
+                                                } else {
+                                                    theme.text_secondary
+                                                };
+                                                // Monospace approximation: a char is roughly 0.6 of the em.
+                                                let char_px = theme.font_size * 0.6;
+                                                let overhead_px = 101.0;
+                                                let filename_chars =
+                                                    item.file_name.chars().count() as f32;
+                                                let avail_px = (theme.picker_pane_width
+                                                    - filename_chars * char_px
+                                                    - overhead_px)
+                                                    .max(0.0);
+                                                let path_max_chars =
+                                                    ((avail_px / char_px) as usize).max(12);
+                                                let display_dir =
+                                                    shorten_dir_for_row(&item.dir, path_max_chars);
+                                                let bar_color =
+                                                    git_status_bar_color(item.git_status.as_deref());
 
                                                 let content_match: Option<(String, Vec<Range<usize>>)> =
                                                     if item.match_ranges.is_empty() {
@@ -1429,140 +1478,155 @@ impl Render for FffPicker {
                                                     .id(("row", i))
                                                     .w_full()
                                                     .h(px(28.0))
-                                                    .pl(px(10.0))
-                                                    .pr(px(12.0))
                                                     .flex()
                                                     .items_center()
-                                                    .justify_between()
-                                                    .gap(px(8.0))
                                                     .bg(if is_selected {
-                                                        rgb(palette.selected_row)
+                                                        rgb(theme.selected_row)
                                                     } else {
-                                                        rgb(palette.bg)
+                                                        rgb(theme.bg)
                                                     })
-                                                    .hover(|s| s.bg(rgb(palette.hover_row)))
+                                                    .hover(|s| s.bg(rgb(theme.hover_row)))
                                                     .cursor_pointer()
                                                     .on_click(cx.listener(move |this, _, window, cx| {
                                                         this.on_select_row(i, window, cx);
                                                     }))
+                                                    .child({
+                                                        let mut bar = div()
+                                                            .w(px(3.0))
+                                                            .h(px(18.0))
+                                                            .flex_shrink_0();
+                                                        if let Some(color) = bar_color {
+                                                            bar = bar.bg(rgb(color));
+                                                        }
+                                                        bar
+                                                    })
                                                     .child(
                                                         div()
-                                                            .w(px(8.0))
-                                                            .flex_shrink_0()
-                                                            .text_color(if is_selected {
-                                                                rgb(palette.match_highlight)
-                                                            } else if is_marked {
-                                                                rgb(palette.text_primary)
-                                                            } else {
-                                                                rgb(palette.text_dim)
-                                                            })
-                                                            .child(if is_marked {
-                                                                "\u{258A}"
-                                                            } else if is_selected {
-                                                                "\u{203A}"
-                                                            } else {
-                                                                " "
-                                                            }),
-                                                    )
-                                                    .child(
-                                                        div()
+                                                            .pl(px(10.0))
+                                                            .pr(px(12.0))
                                                             .flex_1()
                                                             .min_w(px(0.0))
-                                                            .overflow_hidden()
-                                                            .text_sm()
-                                                            .when(content_match.is_some(), |d| {
-                                                                let (text, ranges) =
-                                                                    content_match.as_ref().unwrap();
-                                                                d.flex()
-                                                                    .items_center()
-                                                                    .gap(px(6.0))
-                                                                    .child(
-                                                                        div()
-                                                                            .text_color(rgb(
-                                                                                palette.text_dim,
-                                                                            ))
-                                                                            .flex_shrink_0()
-                                                                            .child(
-                                                                                item.file_name
-                                                                                    .clone(),
-                                                                            ),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .text_color(rgb(
-                                                                                palette.text_secondary,
-                                                                            ))
-                                                                            .flex_shrink_0()
-                                                                            .child(format!(
-                                                                                ":{}",
-                                                                                item.grep_matches
-                                                                                    .first()
-                                                                                    .map(|m| m.line_number)
-                                                                                    .unwrap_or(0)
-                                                                            )),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .flex_1()
-                                                                            .min_w(px(0.0))
-                                                                            .overflow_hidden()
-                                                                            .child(
-                                                                                render_highlighted(
-                                                                                    text, ranges,
-                                                                                ),
-                                                                            ),
-                                                                    )
-                                                            })
-                                                            .when(content_match.is_none(), |d| {
-                                                                d.child(render_highlighted(
-                                                                    &item.file_name,
-                                                                    &item.match_ranges,
-                                                                ))
-                                                            }),
-                                                    )
-                                                    .child(
-                                                        div()
                                                             .flex()
-                                                            .flex_shrink_0()
                                                             .items_center()
-                                                            .gap(px(4.0))
-                                                            .when(git_badge.is_some(), |this| {
-                                                                let (label, color) = git_badge.unwrap();
-                                                                this.child(
-                                                                    div()
-                                                                        .text_xs()
-                                                                        .text_color(rgb(color))
-                                                                        .child(label),
-                                                                )
-                                                            })
-                                                            .when(
-                                                                !item.grep_matches.is_empty(),
-                                                                |this| {
-                                                                    this.child(
-                                                                        div()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(
-                                                                                palette.match_highlight,
-                                                                            ))
-                                                                            .flex_shrink_0()
-                                                                            .child(format!(
-                                                                                "{}",
-                                                                                item.grep_matches
-                                                                                    .len()
-                                                                            )),
-                                                                    )
-                                                                },
+                                                            .gap(px(8.0))
+                                                            .child(
+                                                                div()
+                                                                    .flex_1()
+                                                                    .min_w(px(0.0))
+                                                                    .overflow_hidden()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .gap(px(8.0))
+                                                                    .text_sm()
+                                                                    .when(content_match.is_some(), |d| {
+                                                                        let (text, ranges) =
+                                                                            content_match.as_ref().unwrap();
+                                                                        d.child(
+                                                                            div()
+                                                                                .text_color(rgb(
+                                                                                    theme.text_dim,
+                                                                                ))
+                                                                                .flex_shrink_0()
+                                                                                .child(
+                                                                                    item.file_name.clone(),
+                                                                                ),
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .text_color(rgb(
+                                                                                    theme.text_secondary,
+                                                                                ))
+                                                                                .flex_shrink_0()
+                                                                                .child(format!(
+                                                                                    ":{}",
+                                                                                    item.grep_matches
+                                                                                        .first()
+                                                                                        .map(|m| m.line_number)
+                                                                                        .unwrap_or(0)
+                                                                                )),
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .flex_1()
+                                                                                .min_w(px(0.0))
+                                                                                .overflow_hidden()
+                                                                                .child(
+                                                                                    render_highlighted(
+                                                                                        text,
+                                                                                        ranges,
+                                                                                        &theme,
+                                                                                    ),
+                                                                                ),
+                                                                        )
+                                                                    })
+                                                                    .when(content_match.is_none(), |d| {
+                                                                        d.child(
+                                                                            div()
+                                                                                .flex_shrink_0()
+                                                                                .child(render_highlighted(
+                                                                                    &item.file_name,
+                                                                                    &item.match_ranges,
+                                                                                    &theme,
+                                                                                )),
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .text_xs()
+                                                                                .text_color(rgb(
+                                                                                    theme.text_secondary,
+                                                                                ))
+                                                                                .min_w(px(0.0))
+                                                                                .overflow_hidden()
+                                                                                .child(display_dir.clone()),
+                                                                        )
+                                                                    }),
                                                             )
                                                             .child(
                                                                 div()
-                                                                    .text_xs()
-                                                                    .text_color(rgb(
-                                                                        palette.text_secondary,
-                                                                    ))
-                                                                    .max_w(px(190.0))
+                                                                    .flex()
                                                                     .flex_shrink_0()
-                                                                    .overflow_hidden()
-                                                                    .child(display_dir),
+                                                                    .items_center()
+                                                                    .gap(px(6.0))
+                                                                    .when(
+                                                                        !item.grep_matches.is_empty(),
+                                                                        |this| {
+                                                                            this.child(
+                                                                                div()
+                                                                                    .text_xs()
+                                                                                    .text_color(rgb(badge_color))
+                                                                                    .flex_shrink_0()
+                                                                                    .child(format!(
+                                                                                        "{}",
+                                                                                        item.grep_matches
+                                                                                            .len()
+                                                                                    )),
+                                                                            )
+                                                                        },
+                                                                    )
+                                                                    .when(
+                                                                        item.frecency_score > 0,
+                                                                        |this| {
+                                                                            this.child(
+                                                                                div()
+                                                                                    .text_xs()
+                                                                                    .text_color(rgb(badge_color))
+                                                                                    .flex_shrink_0()
+                                                                                    .child(format!(
+                                                                                        "\u{2728} {}",
+                                                                                        item.frecency_score
+                                                                                    )),
+                                                                            )
+                                                                        },
+                                                                    )
+                                                                    .when(is_marked, |this| {
+                                                                        this.child(
+                                                                            div()
+                                                                                .text_xs()
+                                                                                .text_color(rgb(badge_color))
+                                                                                .flex_shrink_0()
+                                                                                .child("\u{25CF}"),
+                                                                        )
+                                                                    }),
                                                             ),
                                                     )
                                             })
@@ -1573,7 +1637,8 @@ impl Render for FffPicker {
                                 .w_full()
                                 .track_scroll(list_scroll),
                             );
-                        this.child(list_panel)
+                            this.child(list_panel)
+                        }
                     }),
                     )
                     .child(
@@ -1585,10 +1650,10 @@ impl Render for FffPicker {
                     .items_center()
                     .gap(px(8.0))
                     .border_t_1()
-                    .border_color(rgb(palette.border))
+                    .border_color(rgb(theme.border))
                     .child(
                         div()
-                            .text_color(rgb(palette.match_highlight))
+                            .text_color(rgb(theme.match_highlight))
                             .text_sm()
                             .child("🪿"),
                     )
@@ -1597,7 +1662,9 @@ impl Render for FffPicker {
                             .flex_1()
                             .w_full()
                             .min_w(px(0.0))
-                            .font_family(buffer_font_family.clone())
+                            .when_some(buffer_font_family.clone(), |this, family| {
+                                this.font_family(family)
+                            })
                             .child(self.text_field.clone()),
                     ),
                     )
@@ -1606,7 +1673,7 @@ impl Render for FffPicker {
                 div()
                     .w(px(1.0))
                     .h_full()
-                    .bg(rgb(palette.border))
+                    .bg(rgb(theme.border))
                     .flex_shrink_0(),
             )
                     .child(
@@ -1615,8 +1682,23 @@ impl Render for FffPicker {
                             .h_full()
                             .flex()
                             .flex_col()
-                            .bg(rgb(palette.preview_bg))
+                            .bg(rgb(theme.preview_bg))
                             .overflow_hidden()
+                            .when_some(preview_header_path, |this, path| {
+                                this.child(
+                                    div()
+                                        .w_full()
+                                        .h(px(28.0))
+                                        .px(px(12.0))
+                                        .flex()
+                                        .items_center()
+                                        .border_b_1()
+                                        .border_color(rgb(theme.border))
+                                        .text_xs()
+                                        .text_color(rgb(theme.text_secondary))
+                                        .child(path),
+                                )
+                            })
                             .when(preview_lines.is_empty(), |this| {
                                 this.child(
                                     div()
@@ -1625,7 +1707,7 @@ impl Render for FffPicker {
                                 .items_center()
                                 .justify_center()
                                 .text_xs()
-                                .text_color(rgb(palette.text_dim))
+                                .text_color(rgb(theme.text_dim))
                                 .child(preview_placeholder),
                         )
                     })
@@ -1638,11 +1720,13 @@ impl Render for FffPicker {
                                         div()
                                             .id(("pl", i))
                                             .h(preview_line_height)
-                                            .px(px(8.0))
-                                            .flex()
-                                            .items_center()
-                                            .font_family(buffer_font_family.clone())
-                                            .children(line.spans.iter().map(|span| {
+                                        .px(px(8.0))
+                                        .flex()
+                                        .items_center()
+                                        .when_some(buffer_font_family.clone(), |this, family| {
+                                            this.font_family(family)
+                                        })
+                                        .children(line.spans.iter().map(|span| {
                                                 let mut element = div()
                                                     .text_xs()
                                                     .line_height(px(14.0))
@@ -1674,19 +1758,19 @@ impl Render for FffPicker {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .bg(rgb(palette.status_bar_bg))
+                    .bg(rgb(theme.status_bar_bg))
                     .border_t_1()
-                    .border_color(rgb(palette.border))
+                    .border_color(rgb(theme.border))
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(palette.text_dim))
+                            .text_color(rgb(theme.text_dim))
                             .child(status_text),
                     )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(theme.palette.text_dim))
+                            .text_color(rgb(theme.text_dim))
                             .child(match self.view {
                                 SearchView::Grep => {
                                     "\u{2191}\u{2193} nav  tab toggle  \u{21E7}tab mode  \u{23CE} open  esc quit"

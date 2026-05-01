@@ -187,6 +187,13 @@ pub fn load_config_from(path: &Path) -> Result<LoadedConfig> {
         );
         config.window_height = DEFAULT_WINDOW_HEIGHT;
     }
+    if !config.picker_pane_width.is_finite() || config.picker_pane_width <= 0.0 {
+        warn!(
+            value = config.picker_pane_width,
+            "invalid picker_pane_width in config; falling back to default"
+        );
+        config.picker_pane_width = DEFAULT_PICKER_PANE_WIDTH;
+    }
     Ok(LoadedConfig {
         path: path.to_path_buf(),
         config,

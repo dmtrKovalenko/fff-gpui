@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, DEFAULT_PICKER_PANE_WIDTH};
 
 const DEFAULT_BG: u32 = 0x1C1C1E;
 const DEFAULT_BORDER: u32 = 0x2F2F31;
@@ -26,11 +26,12 @@ const DEFAULT_MATCH_HIGHLIGHT: u32 = 0x4A9EFF;
 const DEFAULT_PREVIEW_BG: u32 = 0x161618;
 const DEFAULT_UI_FONT_FAMILY: &str = ".ZedSans";
 const DEFAULT_BUFFER_FONT_FAMILY: &str = ".ZedMono";
+pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 
 static ACTIVE_THEME: OnceLock<RwLock<AppTheme>> = OnceLock::new();
 static THEME_VERSION: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Palette {
     pub bg: u32,
     pub border: u32,
@@ -43,13 +44,37 @@ pub struct Palette {
     pub match_highlight: u32,
     pub match_highlight_bg: u32,
     pub preview_bg: u32,
+    pub input_bg: u32,
+    pub input_text: u32,
+    pub cursor: u32,
+    pub cursor_selection: u32,
+    pub font_family: Option<String>,
+    pub buffer_font_family: Option<String>,
+    pub font_size: f32,
+    pub picker_pane_width: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppTheme {
-    pub palette: Palette,
-    pub ui_font_family: SharedString,
-    pub buffer_font_family: SharedString,
+    pub bg: u32,
+    pub border: u32,
+    pub selected_row: u32,
+    pub hover_row: u32,
+    pub text_primary: u32,
+    pub text_secondary: u32,
+    pub text_dim: u32,
+    pub status_bar_bg: u32,
+    pub match_highlight: u32,
+    pub match_highlight_bg: u32,
+    pub preview_bg: u32,
+    pub input_bg: u32,
+    pub input_text: u32,
+    pub cursor: u32,
+    pub cursor_selection: u32,
+    pub font_family: Option<String>,
+    pub buffer_font_family: Option<String>,
+    pub font_size: f32,
+    pub picker_pane_width: f32,
     pub syntax_styles: Vec<(String, SyntaxStyle)>,
     pub syntax_default_color: u32,
 }
@@ -77,6 +102,14 @@ impl Default for Palette {
             match_highlight: DEFAULT_MATCH_HIGHLIGHT,
             match_highlight_bg: 0x2C4870,
             preview_bg: DEFAULT_PREVIEW_BG,
+            input_bg: 0x232326,
+            input_text: 0xE5E5EA,
+            cursor: 0x0A84FF,
+            cursor_selection: 0x0A84FF44,
+            font_family: None,
+            buffer_font_family: None,
+            font_size: DEFAULT_FONT_SIZE,
+            picker_pane_width: DEFAULT_PICKER_PANE_WIDTH,
         }
     }
 }
@@ -84,9 +117,25 @@ impl Default for Palette {
 impl Default for AppTheme {
     fn default() -> Self {
         Self {
-            palette: Palette::default(),
-            ui_font_family: DEFAULT_UI_FONT_FAMILY.into(),
-            buffer_font_family: DEFAULT_BUFFER_FONT_FAMILY.into(),
+            bg: DEFAULT_BG,
+            border: DEFAULT_BORDER,
+            selected_row: DEFAULT_SELECTED_ROW,
+            hover_row: DEFAULT_HOVER_ROW,
+            text_primary: DEFAULT_TEXT_PRIMARY,
+            text_secondary: DEFAULT_TEXT_SECONDARY,
+            text_dim: DEFAULT_TEXT_DIM,
+            status_bar_bg: DEFAULT_STATUS_BAR_BG,
+            match_highlight: DEFAULT_MATCH_HIGHLIGHT,
+            match_highlight_bg: 0x2C4870,
+            preview_bg: DEFAULT_PREVIEW_BG,
+            input_bg: 0x232326,
+            input_text: 0xE5E5EA,
+            cursor: 0x0A84FF,
+            cursor_selection: 0x0A84FF44,
+            font_family: None,
+            buffer_font_family: None,
+            font_size: DEFAULT_FONT_SIZE,
+            picker_pane_width: DEFAULT_PICKER_PANE_WIDTH,
             syntax_styles: Vec::new(),
             syntax_default_color: DEFAULT_TEXT_PRIMARY,
         }
@@ -223,21 +272,28 @@ pub fn current() -> AppTheme {
 }
 
 pub fn palette() -> Palette {
-    current().palette
-}
-
-pub fn ui_font_family() -> SharedString {
-    active_theme_lock()
-        .read()
-        .map(|theme| theme.ui_font_family.clone())
-        .unwrap_or_else(|_| DEFAULT_UI_FONT_FAMILY.into())
-}
-
-pub fn buffer_font_family() -> SharedString {
-    active_theme_lock()
-        .read()
-        .map(|theme| theme.buffer_font_family.clone())
-        .unwrap_or_else(|_| DEFAULT_BUFFER_FONT_FAMILY.into())
+    let theme = current();
+    Palette {
+        bg: theme.bg,
+        border: theme.border,
+        selected_row: theme.selected_row,
+        hover_row: theme.hover_row,
+        text_primary: theme.text_primary,
+        text_secondary: theme.text_secondary,
+        text_dim: theme.text_dim,
+        status_bar_bg: theme.status_bar_bg,
+        match_highlight: theme.match_highlight,
+        match_highlight_bg: theme.match_highlight_bg,
+        preview_bg: theme.preview_bg,
+        input_bg: theme.input_bg,
+        input_text: theme.input_text,
+        cursor: theme.cursor,
+        cursor_selection: theme.cursor_selection,
+        font_family: theme.font_family.clone(),
+        buffer_font_family: theme.buffer_font_family.clone(),
+        font_size: theme.font_size,
+        picker_pane_width: theme.picker_pane_width,
+    }
 }
 
 pub fn syntax_color(capture_name: &str) -> u32 {
@@ -262,7 +318,7 @@ pub fn version() -> u64 {
 }
 
 pub fn sync_from_config(config: &AppConfig, appearance: WindowAppearance, cx: &mut App) {
-    let resolved = if config.sync_zed_settings {
+    let mut resolved = if config.sync_zed_settings {
         match resolve_from_zed_settings(appearance) {
             Ok(theme) => theme,
             Err(err) => {
@@ -273,6 +329,39 @@ pub fn sync_from_config(config: &AppConfig, appearance: WindowAppearance, cx: &m
     } else {
         AppTheme::default()
     };
+
+    if let Some(family) = config.font.family.as_deref() {
+        let trimmed = family.trim();
+        if !trimmed.is_empty() {
+            let family = trimmed.to_string();
+            resolved.font_family = Some(family.clone());
+            resolved.buffer_font_family = Some(family);
+        }
+    }
+    if let Some(size) = config.font.size
+        && size.is_finite()
+        && size > 0.0
+    {
+        resolved.font_size = size;
+    }
+    if config.picker_pane_width.is_finite() && config.picker_pane_width > 0.0 {
+        resolved.picker_pane_width = config.picker_pane_width;
+    }
+    apply_color(&config.theme.bg, &mut resolved.bg);
+    apply_color(&config.theme.border, &mut resolved.border);
+    apply_color(&config.theme.selected_row, &mut resolved.selected_row);
+    apply_color(&config.theme.hover_row, &mut resolved.hover_row);
+    apply_color(&config.theme.text_primary, &mut resolved.text_primary);
+    apply_color(&config.theme.text_secondary, &mut resolved.text_secondary);
+    apply_color(&config.theme.text_dim, &mut resolved.text_dim);
+    apply_color(&config.theme.status_bar_bg, &mut resolved.status_bar_bg);
+    apply_color(&config.theme.match_highlight, &mut resolved.match_highlight);
+    apply_color(&config.theme.match_highlight_bg, &mut resolved.match_highlight_bg);
+    apply_color(&config.theme.preview_bg, &mut resolved.preview_bg);
+    apply_color(&config.theme.input_bg, &mut resolved.input_bg);
+    apply_color(&config.theme.input_text, &mut resolved.input_text);
+    apply_color(&config.theme.cursor, &mut resolved.cursor);
+    apply_color(&config.theme.cursor_selection, &mut resolved.cursor_selection);
 
     cx.set_global(resolved.clone());
     if let Ok(mut guard) = active_theme_lock().write() {
@@ -368,22 +457,35 @@ fn resolve_from_zed_settings(appearance: WindowAppearance) -> Result<AppTheme> {
 
     Ok(match resolved_name {
         Some(name) => match catalog.get(&normalize_name(&name)).cloned() {
-            Some(entry) => {
-                AppTheme {
-                    palette: entry.palette,
-                    ui_font_family,
-                    buffer_font_family,
-                    syntax_default_color: entry.syntax_default_color,
-                    syntax_styles: entry.syntax_styles,
-                }
-            }
+            Some(entry) => AppTheme {
+                bg: entry.palette.bg,
+                border: entry.palette.border,
+                selected_row: entry.palette.selected_row,
+                hover_row: entry.palette.hover_row,
+                text_primary: entry.palette.text_primary,
+                text_secondary: entry.palette.text_secondary,
+                text_dim: entry.palette.text_dim,
+                status_bar_bg: entry.palette.status_bar_bg,
+                match_highlight: entry.palette.match_highlight,
+                match_highlight_bg: entry.palette.match_highlight_bg,
+                preview_bg: entry.palette.preview_bg,
+                input_bg: 0x232326,
+                input_text: 0xE5E5EA,
+                cursor: 0x0A84FF,
+                cursor_selection: 0x0A84FF44,
+                font_family: Some(ui_font_family.to_string()),
+                buffer_font_family: Some(buffer_font_family.to_string()),
+                font_size: DEFAULT_FONT_SIZE,
+                picker_pane_width: DEFAULT_PICKER_PANE_WIDTH,
+                syntax_default_color: entry.syntax_default_color,
+                syntax_styles: entry.syntax_styles,
+            },
             None => {
                 warn!(theme = %name, "Zed theme not found; using built-in fallback theme");
-                AppTheme {
-                    ui_font_family,
-                    buffer_font_family,
-                    ..AppTheme::default()
-                }
+                let mut theme = AppTheme::default();
+                theme.font_family = Some(ui_font_family.to_string());
+                theme.buffer_font_family = Some(buffer_font_family.to_string());
+                theme
             }
         },
         None => {
@@ -391,11 +493,10 @@ fn resolve_from_zed_settings(appearance: WindowAppearance) -> Result<AppTheme> {
                 settings_path = %zed_settings_path().display(),
                 "no Zed theme configured; using built-in fallback theme"
             );
-            AppTheme {
-                ui_font_family,
-                buffer_font_family,
-                ..AppTheme::default()
-            }
+            let mut theme = AppTheme::default();
+            theme.font_family = Some(ui_font_family.to_string());
+            theme.buffer_font_family = Some(buffer_font_family.to_string());
+            theme
         }
     })
 }
@@ -515,7 +616,10 @@ fn palette_from_style(style: &Value) -> Palette {
             .or_else(|| color_from_style(style, "editor.background"))
             .unwrap_or(DEFAULT_BG),
         border: color_from_style(style, "border").unwrap_or(DEFAULT_BORDER),
-        selected_row: color_from_style(style, "element.selected")
+        selected_row: color_from_style(style, "ghost_element.selected")
+            .or_else(|| color_from_style(style, "elevated_surface.background"))
+            .or_else(|| color_from_style(style, "drop_target.background"))
+            .or_else(|| color_from_style(style, "element.selected"))
             .or_else(|| color_from_style(style, "element.active"))
             .unwrap_or(DEFAULT_SELECTED_ROW),
         hover_row: color_from_style(style, "element.hover").unwrap_or(DEFAULT_HOVER_ROW),
@@ -540,6 +644,15 @@ fn palette_from_style(style: &Value) -> Palette {
         preview_bg: color_from_style(style, "editor.background")
             .or_else(|| color_from_style(style, "surface.background"))
             .unwrap_or(DEFAULT_PREVIEW_BG),
+        input_bg: color_from_style(style, "input.background").unwrap_or(0x232326),
+        input_text: color_from_style(style, "input.foreground").unwrap_or(0xE5E5EA),
+        cursor: color_from_style(style, "editor.cursor").unwrap_or(0x0A84FF),
+        cursor_selection: color_from_style(style, "editor.selectionBackground")
+            .unwrap_or(0x0A84FF44),
+        font_family: None,
+        buffer_font_family: None,
+        font_size: DEFAULT_FONT_SIZE,
+        picker_pane_width: DEFAULT_PICKER_PANE_WIDTH,
     }
 }
 
@@ -665,6 +778,12 @@ fn color_from_style(style: &Value, key: &str) -> Option<u32> {
         .get(key)
         .and_then(Value::as_str)
         .and_then(parse_color_rgb)
+}
+
+fn apply_color(source: &Option<String>, target: &mut u32) {
+    if let Some(color) = source.as_deref().and_then(parse_color_rgb) {
+        *target = color;
+    }
 }
 
 fn parse_color_rgb(color: &str) -> Option<u32> {
