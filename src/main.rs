@@ -25,9 +25,11 @@ use config::AppConfig;
 use picker::{
     CyclePreviousQuery, FffPicker, OpenSelected, PickerSharedState, PreviewScrollDown,
     PreviewScrollUp, Quit, SelectNext, SelectPrev, ShiftTab, SwitchFiles, SwitchGrep,
-    ToggleSelectedAndAdvance,
+    ToggleSelectAll, ToggleSelectedAndAdvance,
 };
-use service::{ServiceCommand, forward_to_running_instance, start_listener};
+use service::{
+    CommandEnvelope, ForwardOutcome, ServiceCommand, forward_to_running_instance, start_listener,
+};
 use text_field::{
     FieldBackspace, FieldCopy, FieldCut, FieldDelete, FieldEnd, FieldHome, FieldLeft, FieldPaste,
     FieldRight, FieldSelectAll, FieldSelectLeft, FieldSelectRight,
@@ -47,12 +49,15 @@ struct LaunchOptions {
     start_in_grep: bool,
 }
 
+type ResponderArc = Arc<Mutex<Option<service::ClientStream>>>;
+
 #[derive(Clone)]
 struct PickerSession {
     base_path: PathBuf,
     shared: PickerSharedState,
     enable_content_indexing: bool,
     start_in_grep: bool,
+    responder: Option<ResponderArc>,
 }
 
 struct RuntimeConfig {
@@ -69,6 +74,7 @@ impl PickerSession {
             shared: PickerSharedState::default(),
             enable_content_indexing,
             start_in_grep,
+            responder: None,
         }
     }
 }
@@ -150,6 +156,7 @@ fn bind_base_keys(cx: &mut App) {
         KeyBinding::new("up", SelectPrev, None),
         KeyBinding::new("down", SelectNext, None),
         KeyBinding::new("tab", ToggleSelectedAndAdvance, None),
+        KeyBinding::new("ctrl-a", ToggleSelectAll, None),
         KeyBinding::new("shift-tab", ShiftTab, None),
         KeyBinding::new("ctrl-up", CyclePreviousQuery, None),
         KeyBinding::new("ctrl-u", PreviewScrollUp, None),
@@ -276,6 +283,7 @@ fn open_window(session: PickerSession, runtime_config: &Arc<Mutex<RuntimeConfig>
     let shared = session.shared;
     let enable_content_indexing = session.enable_content_indexing;
     let start_in_grep = session.start_in_grep;
+    let responder = session.responder;
     let window_width = config.window_width;
     let window_height = config.window_height;
     let bounds = cx
@@ -309,6 +317,7 @@ fn open_window(session: PickerSession, runtime_config: &Arc<Mutex<RuntimeConfig>
                     shared.clone(),
                     enable_content_indexing,
                     start_in_grep,
+                    responder.clone(),
                     cx,
                 )
             });
@@ -358,6 +367,7 @@ fn one_shot_session(
     path: PathBuf,
     sessions: &Arc<Mutex<HashMap<PathBuf, PickerSession>>>,
     start_in_grep: bool,
+    responder: Option<ResponderArc>,
 ) -> PickerSession {
     let fallback_path = path.clone();
     let mut session = sessions
@@ -370,6 +380,7 @@ fn one_shot_session(
         })
         .unwrap_or_else(|_| PickerSession::new(fallback_path, true, start_in_grep));
     session.start_in_grep = start_in_grep;
+    session.responder = responder;
     session
 }
 
@@ -385,13 +396,19 @@ fn show_or_focus_picker(
     }
 }
 
+fn wrap_responder(stream: Option<service::ClientStream>) -> Option<ResponderArc> {
+    stream.map(|s| Arc::new(Mutex::new(Some(s))))
+}
+
 fn handle_service_command(
     command: ServiceCommand,
+    stream: Option<service::ClientStream>,
     session: &Arc<Mutex<PickerSession>>,
     one_shot_sessions: &Arc<Mutex<HashMap<PathBuf, PickerSession>>>,
     runtime_config: &Arc<Mutex<RuntimeConfig>>,
     cx: &mut App,
 ) {
+    let responder = wrap_responder(stream);
     match command {
         ServiceCommand::ShowPicker => {
             debug!("received show-picker service command");
@@ -411,9 +428,14 @@ fn handle_service_command(
                     } else {
                         current.start_in_grep = in_grep;
                     }
+                    current.responder = responder.clone();
                     (changed, current.clone())
                 }
-                Err(_) => (true, PickerSession::new(path.clone(), true, in_grep)),
+                Err(_) => {
+                    let mut s = PickerSession::new(path.clone(), true, in_grep);
+                    s.responder = responder.clone();
+                    (true, s)
+                }
             };
 
             if cx.windows().is_empty() {
@@ -426,7 +448,7 @@ fn handle_service_command(
         ServiceCommand::OpenOneShot { path, in_grep } => {
             debug!(path = %path.display(), in_grep, "received one-shot open service command");
             open_window(
-                one_shot_session(path, one_shot_sessions, in_grep),
+                one_shot_session(path, one_shot_sessions, in_grep, responder),
                 runtime_config,
                 cx,
             );
@@ -443,15 +465,22 @@ fn handle_service_command(
 }
 
 async fn drive_service_commands(
-    rx: async_channel::Receiver<ServiceCommand>,
+    rx: async_channel::Receiver<CommandEnvelope>,
     session: Arc<Mutex<PickerSession>>,
     one_shot_sessions: Arc<Mutex<HashMap<PathBuf, PickerSession>>>,
     runtime_config: Arc<Mutex<RuntimeConfig>>,
     app: AsyncApp,
 ) {
-    while let Ok(command) = rx.recv().await {
+    while let Ok((command, stream)) = rx.recv().await {
         let _ = app.update(|app| {
-            handle_service_command(command, &session, &one_shot_sessions, &runtime_config, app)
+            handle_service_command(
+                command,
+                stream,
+                &session,
+                &one_shot_sessions,
+                &runtime_config,
+                app,
+            )
         });
     }
 }
@@ -519,14 +548,31 @@ fn main() {
         },
     };
 
-    if forward_to_running_instance(&forward_command)
+    match forward_to_running_instance(&forward_command)
         .expect("failed to forward launch request to existing service")
     {
-        info!(?forward_command, "forwarded launch to running instance");
-        return;
+        ForwardOutcome::NoDaemon => {
+            info!("no resident service; this process will become the daemon");
+        }
+        ForwardOutcome::Picked(entries) => {
+            info!(count = entries.len(), "received pick response from daemon");
+            for entry in entries {
+                let goto = entry.line.zip(entry.column);
+                match editor::open_in_editor(&entry.path, goto) {
+                    Ok(mut child) => {
+                        let _ = child.wait();
+                    }
+                    Err(err) => eprintln!(
+                        "fff-gpui: failed to open {}: {err}",
+                        entry.path.display()
+                    ),
+                }
+            }
+            return;
+        }
     }
 
-    let (service_tx, service_rx) = async_channel::unbounded::<ServiceCommand>();
+    let (service_tx, service_rx) = async_channel::unbounded::<CommandEnvelope>();
     start_listener(service_tx.clone()).expect("failed to start launch request listener");
     info!("resident service listener started");
 
@@ -568,7 +614,7 @@ fn main() {
         .detach();
         if let Some(path) = launch.open_path.clone() {
             open_window(
-                one_shot_session(path, &one_shot_sessions, launch.start_in_grep),
+                one_shot_session(path, &one_shot_sessions, launch.start_in_grep, None),
                 &runtime_config,
                 cx,
             );

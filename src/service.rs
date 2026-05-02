@@ -4,16 +4,53 @@ use std::thread;
 
 use anyhow::{Context as _, Result};
 use async_channel::Sender;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, warn};
 
-#[derive(Debug, Clone)]
+#[cfg(unix)]
+pub type ClientStream = std::os::unix::net::UnixStream;
+#[cfg(not(unix))]
+pub type ClientStream = std::convert::Infallible;
+
+pub type CommandEnvelope = (ServiceCommand, Option<ClientStream>);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ServiceCommand {
-    OpenPath { path: PathBuf, in_grep: bool },
-    OpenOneShot { path: PathBuf, in_grep: bool },
+    OpenPath {
+        path: PathBuf,
+        #[serde(default)]
+        in_grep: bool,
+    },
+    OpenOneShot {
+        path: PathBuf,
+        #[serde(default)]
+        in_grep: bool,
+    },
     OpenConfig,
     ShowPicker,
     ToggleWindow,
     Quit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PickEntry {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub line: Option<usize>,
+    #[serde(default)]
+    pub column: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PickResponse {
+    pub paths: Vec<PickEntry>,
+}
+
+#[derive(Debug)]
+pub enum ForwardOutcome {
+    NoDaemon,
+    Picked(Vec<PickEntry>),
 }
 
 fn socket_path() -> PathBuf {
@@ -24,80 +61,32 @@ fn socket_path() -> PathBuf {
 }
 
 #[cfg(unix)]
-fn read_request(line: String) -> Option<ServiceCommand> {
+fn read_request(line: &str) -> Option<ServiceCommand> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
     }
-
-    fn split_path_and_grep(payload: &str) -> (PathBuf, bool) {
-        match payload.split_once('\t') {
-            Some((path, "grep")) => (PathBuf::from(path), true),
-            _ => (PathBuf::from(payload), false),
+    match serde_json::from_str::<ServiceCommand>(trimmed) {
+        Ok(command) => Some(command),
+        Err(err) => {
+            warn!(error = %err, line = %trimmed, "failed to parse service request");
+            None
         }
     }
-
-    if let Some(payload) = trimmed.strip_prefix("open\t") {
-        let (path, in_grep) = split_path_and_grep(payload);
-        return Some(ServiceCommand::OpenOneShot { path, in_grep });
-    }
-
-    if trimmed == "config" {
-        return Some(ServiceCommand::OpenConfig);
-    }
-
-    if let Some(payload) = trimmed.strip_prefix("path\t") {
-        let (path, in_grep) = split_path_and_grep(payload);
-        return Some(ServiceCommand::OpenPath { path, in_grep });
-    }
-
-    match trimmed {
-        "show" => return Some(ServiceCommand::ShowPicker),
-        "toggle" => return Some(ServiceCommand::ToggleWindow),
-        "quit" => return Some(ServiceCommand::Quit),
-        _ => {}
-    }
-
-    (!trimmed.is_empty()).then(|| ServiceCommand::OpenPath {
-        path: PathBuf::from(trimmed),
-        in_grep: false,
-    })
-}
-
-#[cfg(not(unix))]
-fn read_request(_line: String) -> Option<ServiceCommand> {
-    None
 }
 
 fn write_request(stream: &mut impl Write, command: &ServiceCommand) -> Result<()> {
-    fn grep_suffix(in_grep: bool) -> &'static str {
-        if in_grep { "\tgrep" } else { "" }
-    }
-
-    match command {
-        ServiceCommand::OpenPath { path, in_grep } => writeln!(
-            stream,
-            "path\t{}{}",
-            path.display(),
-            grep_suffix(*in_grep)
-        ),
-        ServiceCommand::OpenOneShot { path, in_grep } => writeln!(
-            stream,
-            "open\t{}{}",
-            path.display(),
-            grep_suffix(*in_grep)
-        ),
-        ServiceCommand::OpenConfig => writeln!(stream, "config"),
-        ServiceCommand::ShowPicker => writeln!(stream, "show"),
-        ServiceCommand::ToggleWindow => writeln!(stream, "toggle"),
-        ServiceCommand::Quit => writeln!(stream, "quit"),
-    }
-    .context("failed to send launch request")
+    let payload = serde_json::to_string(command).context("failed to serialize launch request")?;
+    writeln!(stream, "{payload}").context("failed to send launch request")
 }
 
-/// Try to forward this launch to a running service instance.
+/// Forward this launch to a running service instance and wait for the picker's response.
+///
+/// On unix: writes the request to the daemon's socket, then reads back a single JSON
+/// `PickResponse` line. The client uses the response to spawn editors itself, which is what
+/// makes terminal editors (nvim, helix, etc.) work — the daemon has no TTY but the client does.
 #[instrument(skip(command), fields(command = ?command))]
-pub fn forward_to_running_instance(command: &ServiceCommand) -> Result<bool> {
+pub fn forward_to_running_instance(command: &ServiceCommand) -> Result<ForwardOutcome> {
     #[cfg(unix)]
     {
         use std::os::unix::net::UnixStream;
@@ -109,11 +98,14 @@ pub fn forward_to_running_instance(command: &ServiceCommand) -> Result<bool> {
                 write_request(&mut stream, command)?;
                 let _ = stream.flush();
                 info!("forwarded launch request to resident service");
-                Ok(true)
+
+                let reader = BufReader::new(&stream);
+                let entries = read_pick_response(reader);
+                Ok(ForwardOutcome::Picked(entries))
             }
             Err(err) => {
                 debug!(error = %err, "no resident service available");
-                Ok(false)
+                Ok(ForwardOutcome::NoDaemon)
             }
         }
     }
@@ -121,13 +113,40 @@ pub fn forward_to_running_instance(command: &ServiceCommand) -> Result<bool> {
     #[cfg(not(unix))]
     {
         let _ = command;
-        Ok(false)
+        Ok(ForwardOutcome::NoDaemon)
+    }
+}
+
+#[cfg(unix)]
+fn read_pick_response<R: BufRead>(mut reader: R) -> Vec<PickEntry> {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => {
+            debug!("daemon closed without response");
+            Vec::new()
+        }
+        Ok(_) => match serde_json::from_str::<PickResponse>(line.trim()) {
+            Ok(resp) => resp.paths,
+            Err(err) => {
+                warn!(error = %err, line = %line.trim(), "failed to parse pick response");
+                Vec::new()
+            }
+        },
+        Err(err) => {
+            warn!(error = %err, "failed to read pick response from daemon");
+            Vec::new()
+        }
     }
 }
 
 /// Start the background listener that receives launch requests from subsequent invocations.
+///
+/// The listener keeps each accepted stream alive after parsing the request: the stream is
+/// passed alongside the command so the picker can later write back a `PickResponse` on the
+/// same connection. For non-Open commands (toggle/show/quit/config) the consumer simply
+/// drops the stream, which closes the connection.
 #[instrument(skip(commands))]
-pub fn start_listener(commands: Sender<ServiceCommand>) -> Result<()> {
+pub fn start_listener(commands: Sender<CommandEnvelope>) -> Result<()> {
     #[cfg(unix)]
     {
         use std::fs;
@@ -153,10 +172,11 @@ pub fn start_listener(commands: Sender<ServiceCommand>) -> Result<()> {
                     let mut reader = BufReader::new(stream);
                     let mut line = String::new();
                     if reader.read_line(&mut line).is_ok()
-                        && let Some(request) = read_request(line)
+                        && let Some(request) = read_request(&line)
                     {
                         debug!(?request, "received service request");
-                        let _ = commands.send_blocking(request);
+                        let stream = reader.into_inner();
+                        let _ = commands.send_blocking((request, Some(stream)));
                     }
                 }
             })
@@ -169,4 +189,100 @@ pub fn start_listener(commands: Sender<ServiceCommand>) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_open_one_shot() {
+        let cmd = ServiceCommand::OpenOneShot {
+            path: PathBuf::from("/tmp/foo"),
+            in_grep: true,
+        };
+        let s = serde_json::to_string(&cmd).unwrap();
+        let back: ServiceCommand = serde_json::from_str(&s).unwrap();
+        match back {
+            ServiceCommand::OpenOneShot { path, in_grep } => {
+                assert_eq!(path, PathBuf::from("/tmp/foo"));
+                assert!(in_grep);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_open_path_minimal() {
+        let cmd = ServiceCommand::OpenPath {
+            path: PathBuf::from("/home/u/proj"),
+            in_grep: false,
+        };
+        let s = serde_json::to_string(&cmd).unwrap();
+        let back: ServiceCommand = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, ServiceCommand::OpenPath { in_grep: false, .. }));
+    }
+
+    #[test]
+    fn round_trip_unit_variants() {
+        for cmd in [
+            ServiceCommand::OpenConfig,
+            ServiceCommand::ShowPicker,
+            ServiceCommand::ToggleWindow,
+            ServiceCommand::Quit,
+        ] {
+            let s = serde_json::to_string(&cmd).unwrap();
+            let back: ServiceCommand = serde_json::from_str(&s).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&cmd),
+                std::mem::discriminant(&back)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_accepts_missing_in_grep() {
+        let s = r#"{"cmd":"open_path","path":"/x"}"#;
+        let cmd: ServiceCommand = serde_json::from_str(s).unwrap();
+        match cmd {
+            ServiceCommand::OpenPath { path, in_grep } => {
+                assert_eq!(path, PathBuf::from("/x"));
+                assert!(!in_grep);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pick_response_round_trip() {
+        let resp = PickResponse {
+            paths: vec![
+                PickEntry {
+                    path: PathBuf::from("/a/b.rs"),
+                    line: Some(12),
+                    column: Some(4),
+                },
+                PickEntry {
+                    path: PathBuf::from("/a/c.rs"),
+                    line: None,
+                    column: None,
+                },
+            ],
+        };
+        let s = serde_json::to_string(&resp).unwrap();
+        let back: PickResponse = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.paths.len(), 2);
+        assert_eq!(back.paths[0].path, PathBuf::from("/a/b.rs"));
+        assert_eq!(back.paths[0].line, Some(12));
+        assert_eq!(back.paths[0].column, Some(4));
+        assert!(back.paths[1].line.is_none());
+    }
+
+    #[test]
+    fn pick_response_empty_round_trip() {
+        let resp = PickResponse::default();
+        let s = serde_json::to_string(&resp).unwrap();
+        let back: PickResponse = serde_json::from_str(&s).unwrap();
+        assert!(back.paths.is_empty());
+    }
 }

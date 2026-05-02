@@ -3,12 +3,12 @@ use async_channel::Sender;
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 
-use crate::service::ServiceCommand;
+use crate::service::{CommandEnvelope, ServiceCommand};
 
-pub fn install_event_handler(command_tx: Sender<ServiceCommand>) {
+pub fn install_event_handler(command_tx: Sender<CommandEnvelope>) {
     GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
         if event.state() == HotKeyState::Pressed {
-            let _ = command_tx.send_blocking(ServiceCommand::ToggleWindow);
+            let _ = command_tx.send_blocking((ServiceCommand::ToggleWindow, None));
         }
     }));
 }

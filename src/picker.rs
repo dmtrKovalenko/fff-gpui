@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
+use std::io::Write as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -22,8 +23,38 @@ use crate::editor;
 use crate::log;
 use crate::path_shortening::PathShortenStrategy;
 use crate::preview::{self, HighlightedLine};
+use crate::service::{ClientStream, PickEntry, PickResponse};
 use crate::text_field::TextField;
 use crate::theme::{self, AppTheme};
+
+pub type ResponderArc = Arc<Mutex<Option<ClientStream>>>;
+
+// Write a PickResponse to the client and shut the stream so the client unblocks.
+// `responder` is consumed; passing None or a stream that's already been taken is a no-op.
+#[cfg(unix)]
+fn send_pick_response(responder: Option<ResponderArc>, entries: &[PickEntry]) {
+    let Some(arc) = responder else { return };
+    let Ok(mut guard) = arc.lock() else { return };
+    let Some(mut stream) = guard.take() else {
+        return;
+    };
+    let payload = match serde_json::to_string(&PickResponse {
+        paths: entries.to_vec(),
+    }) {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(error = %err, "failed to serialize pick response");
+            return;
+        }
+    };
+    if let Err(err) = writeln!(stream, "{payload}") {
+        warn!(error = %err, "failed to write pick response to client");
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+#[cfg(not(unix))]
+fn send_pick_response(_responder: Option<ResponderArc>, _entries: &[PickEntry]) {}
 
 actions!(
     fff_picker,
@@ -34,6 +65,7 @@ actions!(
         SelectPrev,
         ToggleSelected,
         ToggleSelectedAndAdvance,
+        ToggleSelectAll,
         ShiftTab,
         CycleGrepMode,
         CyclePreviousQuery,
@@ -116,6 +148,7 @@ pub struct FffPicker {
     text_field: Entity<TextField>,
     dismiss_on_blur: Option<Subscription>,
     dismiss_on_window_blur: Option<Subscription>,
+    responder: Option<ResponderArc>,
 }
 
 // Find byte ranges where query characters appear in order.
@@ -344,6 +377,7 @@ impl FffPicker {
         shared: PickerSharedState,
         enable_content_indexing: bool,
         start_in_grep: bool,
+        responder: Option<ResponderArc>,
         cx: &mut Context<Self>,
     ) -> Self {
         let text_field = cx.new(|cx| TextField::new("Search files...", cx));
@@ -396,6 +430,7 @@ impl FffPicker {
             text_field,
             dismiss_on_blur: None,
             dismiss_on_window_blur: None,
+            responder,
         };
 
         instance.start_scan(base_path, enable_content_indexing, cx);
@@ -956,18 +991,9 @@ impl FffPicker {
         .detach();
     }
 
-    // Open the selected file or the first selected file and track the query.
-    fn on_open_selected(&mut self, _: &OpenSelected, window: &mut Window, cx: &mut Context<Self>) {
-        let selected_path = self.selected_paths.iter().next().cloned().or_else(|| {
-            self.results
-                .get(self.selected)
-                .map(|item| item.absolute_path.clone())
-        });
-        let Some(path) = selected_path else {
-            return;
-        };
-        let goto = self
-            .results
+    // Compute the per-path goto (line, column) from the matching grep entry, if any.
+    fn goto_for_path(&self, path: &Path) -> Option<(usize, usize)> {
+        self.results
             .iter()
             .find(|item| item.absolute_path == path)
             .and_then(|item| item.grep_matches.first())
@@ -978,48 +1004,106 @@ impl FffPicker {
                     .first()
                     .and_then(|(start, _)| {
                         let start = *start as usize;
-                        m.line_content.get(..start).map(|prefix| prefix.chars().count() + 1)
+                        m.line_content
+                            .get(..start)
+                            .map(|prefix| prefix.chars().count() + 1)
                     })
                     .unwrap_or(1);
                 (line, column)
-            });
+            })
+    }
 
-        if let Ok(guard) = self.shared_picker.read()
+    // Update frecency / query trackers for the selected paths.
+    fn track_open(&self, paths: &[PathBuf]) {
+        if self.view == SearchView::Grep
+            && let Ok(guard) = self.shared_picker.read()
             && let Some(picker) = guard.as_ref()
             && let Ok(mut tracker_guard) = self.shared_query_tracker.write()
             && let Some(tracker) = tracker_guard.as_mut()
         {
-            let project_path = picker.base_path();
-            match self.view {
-                SearchView::Files => {
-                    let _ = tracker.track_query_completion(&self.query, project_path, &path);
+            let _ = tracker.track_grep_query(&self.query, picker.base_path());
+        }
+
+        for path in paths {
+            if self.view == SearchView::Files
+                && let Ok(guard) = self.shared_picker.read()
+                && let Some(picker) = guard.as_ref()
+                && let Ok(mut tracker_guard) = self.shared_query_tracker.write()
+                && let Some(tracker) = tracker_guard.as_mut()
+            {
+                let _ = tracker.track_query_completion(&self.query, picker.base_path(), path);
+            }
+
+            if let Ok(guard) = self.shared_frecency.read()
+                && let Some(tracker) = guard.as_ref()
+            {
+                let _ = tracker.track_access(path);
+            }
+        }
+    }
+
+    // Open the selected file(s). For client-forwarded sessions writes paths back over the IPC
+    // socket (the client process spawns the editor). For daemon-side sessions (menubar /
+    // hotkey / daemon-startup --open) spawns the editor inline.
+    fn on_open_selected(&mut self, _: &OpenSelected, window: &mut Window, cx: &mut Context<Self>) {
+        let paths_to_open: Vec<PathBuf> = if !self.selected_paths.is_empty() {
+            self.selected_paths.iter().cloned().collect()
+        } else if let Some(item) = self.results.get(self.selected) {
+            vec![item.absolute_path.clone()]
+        } else {
+            return;
+        };
+
+        self.track_open(&paths_to_open);
+
+        let entries: Vec<PickEntry> = paths_to_open
+            .iter()
+            .map(|p| {
+                let goto = self.goto_for_path(p);
+                PickEntry {
+                    path: p.clone(),
+                    line: goto.map(|g| g.0),
+                    column: goto.map(|g| g.1),
                 }
-                SearchView::Grep => {
-                    let _ = tracker.track_grep_query(&self.query, project_path);
+            })
+            .collect();
+
+        if self.responder.is_some() {
+            send_pick_response(self.responder.take(), &entries);
+            window.remove_window();
+            return;
+        }
+
+        let mut opened = 0usize;
+        let mut last_error: Option<String> = None;
+        for entry in &entries {
+            let goto = entry.line.zip(entry.column);
+            match editor::open_in_editor(&entry.path, goto) {
+                Ok(child) => {
+                    info!(pid = child.id(), path = %entry.path.display(), "spawned editor");
+                    opened += 1;
+                }
+                Err(err) => {
+                    error!(error = %err, path = %entry.path.display(), "open failed");
+                    last_error = Some(err.to_string());
                 }
             }
         }
 
-        if let Ok(guard) = self.shared_frecency.read()
-            && let Some(tracker) = guard.as_ref()
-        {
-            let _ = tracker.track_access(&path);
-        }
-
-        match editor::open_in_editor(&path, goto) {
-            Ok(child) => {
-                info!(pid = child.id(), path = %path.display(), "spawned editor");
-                self.status_message = Some(format!("Opened {}", path.display()));
-                cx.notify();
-                window.remove_window();
-            }
-            Err(err) => {
-                error!(error = %err, path = %path.display(), "open failed");
-                let message = format!("Open failed: {err}");
-                self.status_message =
-                    Some(format!("{message}  (log: {})", log::path_for_display()));
-                cx.notify();
-            }
+        if opened > 0 {
+            self.status_message = Some(if entries.len() == 1 {
+                format!("Opened {}", entries[0].path.display())
+            } else {
+                format!("Opened {opened} files")
+            });
+            cx.notify();
+            window.remove_window();
+        } else if let Some(err) = last_error {
+            self.status_message = Some(format!(
+                "Open failed: {err}  (log: {})",
+                log::path_for_display()
+            ));
+            cx.notify();
         }
     }
 
@@ -1027,7 +1111,21 @@ impl FffPicker {
     fn on_quit(&mut self, _: &Quit, window: &mut Window, _cx: &mut Context<Self>) {
         window.remove_window();
     }
+}
 
+// Send an empty PickResponse to the client when the picker is dismissed without a selection
+// (Esc, focus-loss, window-close, session replacement). For non-client sessions
+// (responder=None) this is a no-op. on_open_selected calls take() first so the inner stream is
+// already gone by the time Drop runs after a successful pick.
+impl Drop for FffPicker {
+    fn drop(&mut self) {
+        if self.responder.is_some() {
+            send_pick_response(self.responder.take(), &[]);
+        }
+    }
+}
+
+impl FffPicker {
     // Move selection visually down toward the input — i.e. toward a better-ranked result.
     fn on_select_next(&mut self, _: &SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
         if !self.results.is_empty() && self.selected > 0 {
@@ -1102,6 +1200,24 @@ impl FffPicker {
     ) {
         self.on_toggle_selected(&ToggleSelected, window, cx);
         self.on_select_prev(&SelectPrev, window, cx);
+    }
+
+    // Toggle selection across all visible results: clear if anything is marked,
+    // otherwise mark every result.
+    fn on_toggle_select_all(
+        &mut self,
+        _: &ToggleSelectAll,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_paths.is_empty() {
+            for item in &self.results {
+                self.selected_paths.insert(item.absolute_path.clone());
+            }
+        } else {
+            self.selected_paths.clear();
+        }
+        cx.notify();
     }
 
     // Shift-tab: cycle grep mode in grep view, otherwise move selection up.
@@ -1297,6 +1413,7 @@ impl Render for FffPicker {
             .on_action(cx.listener(Self::on_select_prev))
             .on_action(cx.listener(Self::on_toggle_selected))
             .on_action(cx.listener(Self::on_toggle_and_advance))
+            .on_action(cx.listener(Self::on_toggle_select_all))
             .on_action(cx.listener(Self::on_shift_tab))
             .on_action(cx.listener(Self::on_cycle_grep_mode))
             .on_action(cx.listener(Self::on_cycle_previous_query))

@@ -23,7 +23,7 @@ mod mac {
         sel, sel_impl,
     };
 
-    use crate::service::ServiceCommand;
+    use crate::service::{CommandEnvelope, ServiceCommand};
 
     thread_local! {
         static STATUS_ITEM: RefCell<Option<StatusItemHandle>> = const { RefCell::new(None) };
@@ -32,7 +32,7 @@ mod mac {
     static mut VIEW_CLASS: *const Class = core::ptr::null();
     const STATE_IVAR: &str = "state";
 
-    pub fn install(commands: Sender<ServiceCommand>) {
+    pub fn install(commands: Sender<CommandEnvelope>) {
         STATUS_ITEM.with(|slot| {
             if slot.borrow().is_none() {
                 slot.borrow_mut()
@@ -48,12 +48,12 @@ mod mac {
     }
 
     struct StatusItemState {
-        commands: Sender<ServiceCommand>,
+        commands: Sender<CommandEnvelope>,
         status_item: id,
     }
 
     impl StatusItemHandle {
-        unsafe fn new(commands: Sender<ServiceCommand>) -> Self {
+        unsafe fn new(commands: Sender<CommandEnvelope>) -> Self {
             ensure_view_class();
 
             let status_bar = NSStatusBar::systemStatusBar(nil);
@@ -128,7 +128,7 @@ mod mac {
                     let menu = build_menu(this);
                     let _: () = msg_send![state_ref.status_item, popUpStatusItemMenu: menu];
                 } else {
-                    let _ = commands.send_blocking(ServiceCommand::ToggleWindow);
+                    let _ = commands.send_blocking((ServiceCommand::ToggleWindow, None));
                 }
             }
         }
@@ -138,7 +138,7 @@ mod mac {
         unsafe {
             if let Some(state) = get_state(this).upgrade() {
                 let commands = state.borrow().commands.clone();
-                let _ = commands.send_blocking(ServiceCommand::ShowPicker);
+                let _ = commands.send_blocking((ServiceCommand::ShowPicker, None));
             }
         }
     }
@@ -148,7 +148,7 @@ mod mac {
         unsafe {
             if let Some(state) = get_state(this).upgrade() {
                 let commands = state.borrow().commands.clone();
-                let _ = commands.send_blocking(ServiceCommand::OpenConfig);
+                let _ = commands.send_blocking((ServiceCommand::OpenConfig, None));
             }
         }
     }
@@ -157,7 +157,7 @@ mod mac {
         unsafe {
             if let Some(state) = get_state(this).upgrade() {
                 let commands = state.borrow().commands.clone();
-                let _ = commands.send_blocking(ServiceCommand::Quit);
+                let _ = commands.send_blocking((ServiceCommand::Quit, None));
             }
         }
     }
@@ -219,4 +219,4 @@ mod mac {
 pub use mac::install;
 
 #[cfg(not(target_os = "macos"))]
-pub fn install(_: async_channel::Sender<crate::service::ServiceCommand>) {}
+pub fn install(_: async_channel::Sender<crate::service::CommandEnvelope>) {}
