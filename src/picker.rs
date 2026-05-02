@@ -102,6 +102,8 @@ pub struct FffPicker {
     preview_loading: bool,
     preview_loading_visible: bool,
     preview_scroll_row: usize,
+    preview_start_line: usize,
+    theme_version: u64,
     focus_handle: FocusHandle,
     list_scroll: UniformListScrollHandle,
     preview_scroll: UniformListScrollHandle,
@@ -153,6 +155,8 @@ fn find_match_ranges(query: &str, text: &str) -> Vec<Range<usize>> {
 
 // Render text with character ranges highlighted in the match color.
 fn render_highlighted(text: &str, ranges: &[Range<usize>]) -> Div {
+    let palette = theme::palette();
+
     fn clamp_range_to_char_boundaries(
         text: &str,
         start: usize,
@@ -191,13 +195,13 @@ fn render_highlighted(text: &str, ranges: &[Range<usize>]) -> Div {
         if range.start > last {
             parts.push(
                 div()
-                    .text_color(rgb(theme::TEXT_PRIMARY))
+                    .text_color(rgb(palette.text_primary))
                     .child(text[last..range.start].to_string()),
             );
         }
         parts.push(
             div()
-                .text_color(rgb(theme::MATCH_HIGHLIGHT))
+                .text_color(rgb(palette.match_highlight))
                 .child(text[range.clone()].to_string()),
         );
         last = range.end;
@@ -205,7 +209,7 @@ fn render_highlighted(text: &str, ranges: &[Range<usize>]) -> Div {
     if last < text.len() {
         parts.push(
             div()
-                .text_color(rgb(theme::TEXT_PRIMARY))
+                .text_color(rgb(palette.text_primary))
                 .child(text[last..].to_string()),
         );
     }
@@ -373,6 +377,8 @@ impl FffPicker {
             preview_loading: false,
             preview_loading_visible: false,
             preview_scroll_row: 0,
+            preview_start_line: 1,
+            theme_version: theme::version(),
             focus_handle: cx.focus_handle(),
             list_scroll: UniformListScrollHandle::new(),
             preview_scroll: UniformListScrollHandle::new(),
@@ -852,6 +858,7 @@ impl FffPicker {
                 self.preview_loading = false;
                 self.preview_loading_visible = false;
                 self.preview_scroll_row = 0;
+                self.preview_start_line = 1;
                 return;
             }
         };
@@ -865,6 +872,7 @@ impl FffPicker {
             "loading preview"
         );
         let first_match_line = grep_matches.iter().map(|m| m.line_number as usize).min();
+        let match_highlight = theme::palette().match_highlight;
 
         cx.spawn(
             async move |this: WeakEntity<FffPicker>, cx: &mut AsyncApp| {
@@ -891,8 +899,11 @@ impl FffPicker {
                     for gm in &grep_matches {
                         let idx = (gm.line_number as usize).saturating_sub(start_line);
                         if let Some(line) = lines.get_mut(idx) {
-                            line.spans =
-                                preview::overlay_match_ranges(&line.spans, &gm.byte_ranges);
+                            line.spans = preview::overlay_match_ranges(
+                                &line.spans,
+                                &gm.byte_ranges,
+                                match_highlight,
+                            );
                         }
                     }
                     (start_line, lines)
@@ -907,6 +918,7 @@ impl FffPicker {
                     this.preview_lines = lines;
                     this.preview_loading = false;
                     this.preview_loading_visible = false;
+                    this.preview_start_line = start_line;
                     this.preview_scroll_row = first_match_line
                         .map(|line| line.saturating_sub(start_line))
                         .unwrap_or(0);
@@ -1139,6 +1151,17 @@ impl FffPicker {
 impl Render for FffPicker {
     // Render the picker layout.
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let current_theme_version = theme::version();
+        if self.theme_version != current_theme_version {
+            self.theme_version = current_theme_version;
+            if self.selected < self.results.len() {
+                self.load_preview(cx);
+            }
+        }
+        let palette = theme::palette();
+        let ui_font_family = theme::ui_font_family();
+        let buffer_font_family = theme::buffer_font_family();
+        let preview_line_height = px(14.0);
         let results = self.results.clone();
         let preview_lines = self.preview_lines.clone();
         let selected = self.selected;
@@ -1200,8 +1223,9 @@ impl Render for FffPicker {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(theme::BG))
-            .text_color(white())
+            .bg(rgb(palette.bg))
+            .text_color(rgb(palette.text_primary))
+            .font_family(ui_font_family.clone())
             .child(
                 div()
                     .flex_1()
@@ -1232,7 +1256,7 @@ impl Render for FffPicker {
                                 .items_center()
                                 .justify_center()
                                 .text_sm()
-                                .text_color(rgb(theme::TEXT_DIM))
+                                .text_color(rgb(palette.text_dim))
                                 .child("Indexing\u{2026}"),
                         )
                     })
@@ -1245,7 +1269,7 @@ impl Render for FffPicker {
                                 .items_center()
                                 .justify_center()
                                 .text_sm()
-                                .text_color(rgb(theme::TEXT_DIM))
+                                .text_color(rgb(palette.text_dim))
                                 .child("No files matched"),
                         )
                     })
@@ -1306,11 +1330,11 @@ impl Render for FffPicker {
                                                     .justify_between()
                                                     .gap(px(8.0))
                                                     .bg(if is_selected {
-                                                        rgb(theme::SELECTED_ROW)
+                                                        rgb(palette.selected_row)
                                                     } else {
-                                                        rgb(theme::BG)
+                                                        rgb(palette.bg)
                                                     })
-                                                    .hover(|s| s.bg(rgb(theme::HOVER_ROW)))
+                                                    .hover(|s| s.bg(rgb(palette.hover_row)))
                                                     .cursor_pointer()
                                                     .on_click(cx.listener(move |this, _, window, cx| {
                                                         this.on_select_row(i, window, cx);
@@ -1320,11 +1344,11 @@ impl Render for FffPicker {
                                                             .w(px(8.0))
                                                             .flex_shrink_0()
                                                             .text_color(if is_selected {
-                                                                rgb(theme::MATCH_HIGHLIGHT)
+                                                                rgb(palette.match_highlight)
                                                             } else if is_marked {
-                                                                rgb(theme::TEXT_PRIMARY)
+                                                                rgb(palette.text_primary)
                                                             } else {
-                                                                rgb(theme::TEXT_DIM)
+                                                                rgb(palette.text_dim)
                                                             })
                                                             .child(if is_marked {
                                                                 "\u{258A}"
@@ -1349,7 +1373,7 @@ impl Render for FffPicker {
                                                                     .child(
                                                                         div()
                                                                             .text_color(rgb(
-                                                                                theme::TEXT_DIM,
+                                                                                palette.text_dim,
                                                                             ))
                                                                             .flex_shrink_0()
                                                                             .child(
@@ -1360,7 +1384,7 @@ impl Render for FffPicker {
                                                                     .child(
                                                                         div()
                                                                             .text_color(rgb(
-                                                                                theme::TEXT_SECONDARY,
+                                                                                palette.text_secondary,
                                                                             ))
                                                                             .flex_shrink_0()
                                                                             .child(format!(
@@ -1412,7 +1436,7 @@ impl Render for FffPicker {
                                                                         div()
                                                                             .text_xs()
                                                                             .text_color(rgb(
-                                                                                theme::MATCH_HIGHLIGHT,
+                                                                                palette.match_highlight,
                                                                             ))
                                                                             .flex_shrink_0()
                                                                             .child(format!(
@@ -1427,7 +1451,7 @@ impl Render for FffPicker {
                                                                 div()
                                                                     .text_xs()
                                                                     .text_color(rgb(
-                                                                        theme::TEXT_SECONDARY,
+                                                                        palette.text_secondary,
                                                                     ))
                                                                     .max_w(px(190.0))
                                                                     .flex_shrink_0()
@@ -1455,21 +1479,28 @@ impl Render for FffPicker {
                     .items_center()
                     .gap(px(8.0))
                     .border_t_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(rgb(palette.border))
                     .child(
                         div()
-                            .text_color(rgb(theme::MATCH_HIGHLIGHT))
+                            .text_color(rgb(palette.match_highlight))
                             .text_sm()
                             .child("🪿"),
                     )
-                    .child(self.text_field.clone()),
+                    .child(
+                        div()
+                            .flex_1()
+                            .w_full()
+                            .min_w(px(0.0))
+                            .font_family(buffer_font_family.clone())
+                            .child(self.text_field.clone()),
+                    ),
                     )
             )
             .child(
                 div()
                     .w(px(1.0))
                     .h_full()
-                    .bg(rgb(theme::BORDER))
+                    .bg(rgb(palette.border))
                     .flex_shrink_0(),
             )
                     .child(
@@ -1478,7 +1509,7 @@ impl Render for FffPicker {
                             .h_full()
                             .flex()
                             .flex_col()
-                            .bg(rgb(theme::PREVIEW_BG))
+                            .bg(rgb(palette.preview_bg))
                             .overflow_hidden()
                             .when(preview_lines.is_empty(), |this| {
                                 this.child(
@@ -1488,7 +1519,7 @@ impl Render for FffPicker {
                                 .items_center()
                                 .justify_center()
                                 .text_xs()
-                                .text_color(rgb(theme::TEXT_DIM))
+                                .text_color(rgb(palette.text_dim))
                                 .child(preview_placeholder),
                         )
                     })
@@ -1500,15 +1531,20 @@ impl Render for FffPicker {
                                         let line = &preview_lines[i];
                                         div()
                                             .id(("pl", i))
-                                            .h(px(18.0))
-                                            .px(px(12.0))
+                                            .h(preview_line_height)
+                                            .px(px(8.0))
                                             .flex()
                                             .items_center()
-                                            .font_family("Menlo")
+                                            .font_family(buffer_font_family.clone())
                                             .children(line.spans.iter().map(|span| {
                                                 div()
                                                     .text_xs()
+                                                    .line_height(px(14.0))
                                                     .text_color(rgb(span.color))
+                                                    .when(span.bold, |d| d.font_weight(FontWeight::BOLD))
+                                                    .when(span.italic, |d| d.italic())
+                                                    .when(span.underline, |d| d.underline())
+                                                    .when(span.strikethrough, |d| d.line_through())
                                                     .child(span.text.clone())
                                             }))
                                     })
@@ -1529,19 +1565,19 @@ impl Render for FffPicker {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .bg(rgb(theme::STATUS_BAR_BG))
+                    .bg(rgb(palette.status_bar_bg))
                     .border_t_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(rgb(palette.border))
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(theme::TEXT_DIM))
+                            .text_color(rgb(palette.text_dim))
                             .child(status_text),
                     )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(theme::TEXT_DIM))
+                            .text_color(rgb(palette.text_dim))
                             .child("\u{2191}\u{2193} navigate  \u{23CE} open  esc quit"),
                     ),
             )

@@ -2,15 +2,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
-use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     #[serde(alias = "launch_on_startup")]
     pub launch_at_login: bool,
+    #[serde(rename = "sync-zed-settings")]
+    pub sync_zed_settings: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub global_keybind: Option<String>,
 }
@@ -19,6 +20,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             launch_at_login: true,
+            sync_zed_settings: true,
             global_keybind: None,
         }
     }
@@ -129,43 +131,4 @@ pub fn write_config(path: &Path, config: &AppConfig) -> Result<()> {
         .with_context(|| format!("failed to write config file {}", path.display()))?;
     info!(path = %path.display(), "wrote default config");
     Ok(())
-}
-
-pub fn watch_config_path(
-    path: PathBuf,
-    tx: async_channel::Sender<()>,
-) -> Result<notify::RecommendedWatcher> {
-    let watched_path = path.clone();
-    let parent = config_parent(&path);
-    let mut watcher =
-        notify::recommended_watcher(move |result: notify::Result<notify::Event>| match result {
-            Ok(event) => {
-                if event.paths.iter().any(|event_path| {
-                    event_path == &watched_path
-                        || parent.as_ref().is_some_and(|parent| event_path == parent)
-                }) {
-                    debug!(?event.kind, paths = ?event.paths, "config file event");
-                    let _ = tx.send_blocking(());
-                }
-            }
-            Err(err) => {
-                warn!(error = %err, "config watcher error");
-            }
-        })?;
-
-    if let Some(parent) = config_parent(&path)
-        && parent.exists()
-    {
-        watcher
-            .watch(&parent, RecursiveMode::NonRecursive)
-            .with_context(|| format!("failed to watch config path {}", parent.display()))?;
-    }
-
-    if path.exists() {
-        watcher
-            .watch(&path, RecursiveMode::NonRecursive)
-            .with_context(|| format!("failed to watch config path {}", path.display()))?;
-    }
-
-    Ok(watcher)
 }

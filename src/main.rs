@@ -4,7 +4,6 @@ mod config;
 mod editor;
 mod hotkey;
 mod log;
-mod login_item;
 mod menubar;
 mod path_shortening;
 mod picker;
@@ -258,7 +257,9 @@ fn open_config_file(runtime: &Arc<Mutex<RuntimeConfig>>) {
 }
 
 // Open the main picker window centered on the primary display.
-fn open_window(session: PickerSession, cx: &mut App) {
+fn open_window(session: PickerSession, config: &AppConfig, cx: &mut App) {
+    theme::sync_from_config(config, cx.window_appearance(), cx);
+
     let base_path = session.base_path;
     let shared = session.shared;
     let enable_content_indexing = session.enable_content_indexing;
@@ -315,11 +316,19 @@ fn close_all_windows(cx: &mut App) {
     }
 }
 
-fn toggle_picker(session: &Arc<Mutex<PickerSession>>, cx: &mut App) {
+fn toggle_picker(
+    session: &Arc<Mutex<PickerSession>>,
+    runtime_config: &Arc<Mutex<RuntimeConfig>>,
+    cx: &mut App,
+) {
     if cx.windows().is_empty() {
         let session = snapshot_session(session);
+        let config = runtime_config
+            .lock()
+            .map(|state| state.config.clone())
+            .unwrap_or_default();
         info!(base_path = %session.base_path.display(), "opening picker window");
-        open_window(session, cx);
+        open_window(session, &config, cx);
     } else {
         info!("closing picker window(s)");
         close_all_windows(cx);
@@ -350,11 +359,19 @@ fn one_shot_session(
         .unwrap_or_else(|_| PickerSession::new(fallback_path, true))
 }
 
-fn show_or_focus_picker(session: &Arc<Mutex<PickerSession>>, cx: &mut App) {
+fn show_or_focus_picker(
+    session: &Arc<Mutex<PickerSession>>,
+    runtime_config: &Arc<Mutex<RuntimeConfig>>,
+    cx: &mut App,
+) {
     if cx.windows().is_empty() {
         let session = snapshot_session(session);
+        let config = runtime_config
+            .lock()
+            .map(|state| state.config.clone())
+            .unwrap_or_default();
         info!(base_path = %session.base_path.display(), "reopening picker window");
-        open_window(session, cx);
+        open_window(session, &config, cx);
     }
 }
 
@@ -368,11 +385,11 @@ fn handle_service_command(
     match command {
         ServiceCommand::ShowPicker => {
             debug!("received show-picker service command");
-            show_or_focus_picker(session, cx)
+            show_or_focus_picker(session, runtime_config, cx)
         }
         ServiceCommand::ToggleWindow => {
             debug!("received toggle-window service command");
-            toggle_picker(session, cx)
+            toggle_picker(session, runtime_config, cx)
         }
         ServiceCommand::OpenPath(path) => {
             debug!(path = %path.display(), "received open-path service command");
@@ -388,15 +405,27 @@ fn handle_service_command(
             };
 
             if cx.windows().is_empty() {
-                open_window(session_snapshot, cx);
+                let config = runtime_config
+                    .lock()
+                    .map(|state| state.config.clone())
+                    .unwrap_or_default();
+                open_window(session_snapshot, &config, cx);
             } else if should_replace {
                 close_all_windows(cx);
-                open_window(session_snapshot, cx);
+                let config = runtime_config
+                    .lock()
+                    .map(|state| state.config.clone())
+                    .unwrap_or_default();
+                open_window(session_snapshot, &config, cx);
             }
         }
         ServiceCommand::OpenOneShot(path) => {
             debug!(path = %path.display(), "received one-shot open service command");
-            open_window(one_shot_session(path, one_shot_sessions), cx);
+            let config = runtime_config
+                .lock()
+                .map(|state| state.config.clone())
+                .unwrap_or_default();
+            open_window(one_shot_session(path, one_shot_sessions), &config, cx);
         }
         ServiceCommand::OpenConfig => {
             debug!("received open-config service command");
@@ -422,46 +451,6 @@ fn drive_service_commands(
                 handle_service_command(command, &session, &one_shot_sessions, &runtime_config, app)
             });
         }
-    }
-}
-
-fn reload_runtime_config(runtime_config: &Arc<Mutex<RuntimeConfig>>, cx: &mut App) {
-    let loaded = {
-        let path = match runtime_config.lock() {
-            Ok(state) => state.config_path.clone(),
-            Err(_) => return,
-        };
-
-        match config::load_config_from(&path) {
-            Ok(loaded) => loaded,
-            Err(err) => {
-                info!(error = %err, path = %path.display(), "failed to reload config");
-                return;
-            }
-        }
-    };
-
-    if !apply_key_bindings(cx, &loaded.config, true) {
-        return;
-    }
-
-    let mut state = match runtime_config.lock() {
-        Ok(state) => state,
-        Err(_) => return,
-    };
-
-    let previous_launch_at_login = state.config.launch_at_login;
-    state.config = loaded.config.clone();
-    state.config_path = loaded.path.clone();
-    let config = state.config.clone();
-    register_global_hotkey(&mut state, &config);
-    login_item::sync_launch_at_login(state.config.launch_at_login);
-
-    if previous_launch_at_login != state.config.launch_at_login {
-        info!(
-            launch_at_login = state.config.launch_at_login,
-            "updated launch-at-login preference"
-        );
     }
 }
 
@@ -535,17 +524,20 @@ fn main() {
 
     let app = Application::new();
     let reopen_session = picker_session.clone();
-    app.on_reopen(move |cx| show_or_focus_picker(&reopen_session, cx));
+    let reopen_runtime_config = runtime_config.clone();
+    app.on_reopen(move |cx| show_or_focus_picker(&reopen_session, &reopen_runtime_config, cx));
 
     app.run(move |cx: &mut App| {
         make_dockless();
         hotkey::install_event_handler(service_tx.clone());
         if let Ok(state) = runtime_config.lock() {
+            theme::sync_from_config(&state.config, cx.window_appearance(), cx);
             let _ = apply_key_bindings(cx, &state.config, false);
         }
         cx.on_action({
             let picker_session = picker_session.clone();
-            move |_: &ToggleWindow, cx| toggle_picker(&picker_session, cx)
+            let runtime_config = runtime_config.clone();
+            move |_: &ToggleWindow, cx| toggle_picker(&picker_session, &runtime_config, cx)
         });
         {
             let runtime_config = runtime_config.clone();
@@ -567,31 +559,15 @@ fn main() {
         })
         .detach();
         if let Some(path) = launch.open_path.clone() {
-            open_window(one_shot_session(path, &one_shot_sessions), cx);
+            let config = runtime_config
+                .lock()
+                .map(|state| state.config.clone())
+                .unwrap_or_default();
+            open_window(one_shot_session(path, &one_shot_sessions), &config, cx);
         } else {
             info!("launching without initial picker window");
         }
         menubar::install(service_tx.clone());
-
-        let (config_tx, config_rx) = async_channel::unbounded::<()>();
-        let config_path = runtime_config
-            .lock()
-            .map(|state| state.config_path.clone())
-            .unwrap_or_else(|_| config::active_config_path());
-        let _config_watcher = config::watch_config_path(config_path, config_tx.clone())
-            .expect("failed to start config watcher");
-
-        cx.spawn({
-            let runtime_config = runtime_config.clone();
-            async move |cx: &mut AsyncApp| {
-                while config_rx.recv().await.is_ok() {
-                    let _ = cx.update(|app| {
-                        reload_runtime_config(&runtime_config, app);
-                    });
-                }
-            }
-        })
-        .detach();
 
         cx.spawn(move |cx: &mut AsyncApp| {
             drive_service_commands(

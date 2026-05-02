@@ -89,8 +89,13 @@ Set a keybind in `~/.config/fff-gpui/config.toml`:
 
 ```toml
 launch_at_login = true
+sync_zed_settings = true
 global_keybind = "cmd+shift+f"
 ```
+
+When `sync_zed_settings` is enabled, fff-gpui reads Zed's `settings.json` and mirrors the UI font, buffer font, light/dark theme selection, and theme colors from any installed Zed theme.
+
+Zed themes are discovered from your local Zed installation, including extension themes under `~/Library/Application Support/Zed/extensions/installed/` on macOS.
 
 Then launch the app once in background mode:
 

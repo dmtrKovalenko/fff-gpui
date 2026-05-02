@@ -9,6 +9,8 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::theme;
+
 actions!(
     fff_text_field,
     [
@@ -475,10 +477,11 @@ impl Element for TextFieldElement {
         } else {
             content
         };
+        let palette = theme::palette();
         let text_color = if input.content.is_empty() {
-            rgb(0x6C6C70)
+            rgb(palette.text_dim)
         } else {
-            rgb(0xE5E5EA)
+            rgb(palette.text_primary)
         };
 
         let run = TextRun {
@@ -529,7 +532,7 @@ impl Element for TextFieldElement {
                         point(bounds.left() + cursor_x, bounds.top() + px(1.0)),
                         size(px(2.0), bounds.bottom() - bounds.top() - px(2.0)),
                     ),
-                    rgb(0x0A84FF),
+                    rgb(palette.match_highlight),
                 )),
             )
         } else {
@@ -545,7 +548,7 @@ impl Element for TextFieldElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x0A84FF44),
+                    rgba((palette.selected_row << 8) | 0x44),
                 )),
                 None,
             )
@@ -625,9 +628,9 @@ impl Render for TextField {
             .px(px(10.0))
             .flex()
             .items_center()
-            .bg(rgb(0x232326))
+            .bg(rgb(theme::palette().bg))
             .border_1()
-            .border_color(rgb(0x2F2F31))
+            .border_color(rgb(theme::palette().border))
             .rounded(px(6.0))
             .line_height(px(18.0))
             .text_size(px(14.0))
