@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 
 use fff_query_parser::{FFFQuery, FileSearchConfig, FuzzyQuery, QueryParser};
 use fff_search::{
-    FFFMode, FilePickerOptions, FuzzySearchOptions, GrepMode, GrepSearchOptions, PaginationArgs,
-    SharedFrecency, SharedPicker, SharedQueryTracker, file_picker::FilePicker,
-    frecency::FrecencyTracker, git::format_git_status_opt,
+    ContentCacheBudget, FFFMode, FilePickerOptions, FuzzySearchOptions, GrepMode,
+    GrepSearchOptions, PaginationArgs, SharedFrecency, SharedPicker, SharedQueryTracker,
+    file_picker::FilePicker, frecency::FrecencyTracker, git::format_git_status_opt,
     query_tracker::QueryTracker,
 };
 use gpui::prelude::*;
@@ -638,6 +638,19 @@ impl FffPicker {
                         FilePickerOptions {
                             base_path: base_path.to_string_lossy().to_string(),
                             enable_mmap_cache: false,
+                            // Disable the persistent grep content cache so
+                            // grep falls back to a per-search reusable buffer
+                            // instead of mmap-pinning every searched file
+                            // (default allows ~512 MB and never frees in a
+                            // daemon-resident picker). Keep max_file_size at
+                            // its default (10 MB) — zeroing it would make
+                            // get_content_for_search reject every file and
+                            // grep would return no matches.
+                            cache_budget: Some(ContentCacheBudget {
+                                max_files: 0,
+                                max_bytes: 0,
+                                ..ContentCacheBudget::default()
+                            }),
                             enable_content_indexing,
                             mode: FFFMode::Neovim,
                             watch: false,

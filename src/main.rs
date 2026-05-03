@@ -42,6 +42,31 @@ actions!(fff_gpui, [ToggleWindow, OpenConfig]);
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+// mimalloc options we tune at startup so freed pages return to the OS quickly
+// instead of being retained in the process. Required because this is a long-
+// lived daemon — without this, RSS climbs after grep and never recovers.
+//
+// Indices match `mi_option_t` in mimalloc.h.
+#[repr(C)]
+#[derive(Clone, Copy)]
+enum MiOption {
+    PurgeDecommits = 5,
+    PurgeDelay = 15,
+    PageFullRetain = 36,
+}
+
+unsafe extern "C" {
+    fn mi_option_set(option: MiOption, value: std::os::raw::c_long);
+}
+
+fn configure_allocator_for_low_rss() {
+    unsafe {
+        mi_option_set(MiOption::PurgeDecommits, 1);
+        mi_option_set(MiOption::PurgeDelay, 0);
+        mi_option_set(MiOption::PageFullRetain, 0);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LaunchOptions {
     base_path: PathBuf,
@@ -539,6 +564,7 @@ async fn drive_service_commands(
 // Launch the resident GPUI service.
 fn main() {
     log::init_tracing();
+    configure_allocator_for_low_rss();
 
     let launch = parse_launch_options();
     if launch.show_help {
