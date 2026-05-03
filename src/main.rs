@@ -395,7 +395,10 @@ fn toggle_picker(
     cx: &mut App,
 ) {
     if cx.windows().is_empty() {
-        let session = snapshot_session(session);
+        let mut session = snapshot_session(session);
+        session.base_path = home_dir();
+        session.start_in_grep = false;
+        session.responder = None;
         info!(base_path = %session.base_path.display(), "opening picker window");
         open_window(session, runtime_config, cx);
     } else {

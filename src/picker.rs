@@ -6,13 +6,13 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use fff_query_parser::{FileSearchConfig, QueryParser};
+use fff_query_parser::{FFFQuery, FileSearchConfig, FuzzyQuery, QueryParser};
 use fff_search::{
     FFFMode, FilePickerOptions, FuzzySearchOptions, GrepMode, GrepSearchOptions, PaginationArgs,
     SharedFrecency, SharedPicker, SharedQueryTracker, file_picker::FilePicker,
-    frecency::FrecencyTracker, git::format_git_status_opt, grep::has_regex_metacharacters,
+    frecency::FrecencyTracker, git::format_git_status_opt,
     query_tracker::QueryTracker,
 };
 use gpui::prelude::*;
@@ -28,6 +28,10 @@ use crate::text_field::TextField;
 use crate::theme::{self, AppTheme, FileIconPath};
 
 pub type ResponderArc = Arc<Mutex<Option<ClientStream>>>;
+
+// Keep live grep snappy by returning partial results quickly; newer keystrokes
+// will preempt any still-running search.
+const GREP_TIME_BUDGET_MS: u64 = 150;
 
 // Write a PickResponse to the client and shut the stream so the client unblocks.
 // `responder` is consumed; passing None or a stream that's already been taken is a no-op.
@@ -131,7 +135,6 @@ pub struct FffPicker {
     scan_done: bool,
     search_epoch: u64,
     search_in_flight: bool,
-    search_queued: bool,
     search_abort: Option<Arc<AtomicBool>>,
     preview_epoch: u64,
     preview_loading: bool,
@@ -262,20 +265,60 @@ fn shorten_dir_for_row(dir: &str, max_chars: usize) -> String {
     PathShortenStrategy::MiddleNumber.shorten_path(std::path::Path::new(trimmed), max_chars)
 }
 
-// Allow fuzzy fallback only for simple identifier-like queries.
+// Keep file search on the fast fuzzy path unless the query looks like a
+// filename or path filter.
 //
-// Code-shaped queries with spaces or punctuation should stay literal so
-// `struct Data {` continues to search file contents instead of collapsing
-// into a weak filename-only fuzzy match.
-fn should_allow_fuzzy_fallback(query: &str) -> bool {
+// This avoids parsing code-shaped queries like `struct Data {` as glob-like
+// constraints, while preserving filename/path searches such as `main.rs`,
+// `src/foo`, `*.toml`, and `type:rust`.
+fn should_parse_file_constraints(query: &str) -> bool {
+    query.split_whitespace().any(|token| {
+        token.contains('/') || token.contains(':') || token.starts_with('.') || token.contains('.')
+    })
+}
+
+// Keep only tokens that can actually help fuzzy file-name matching.
+//
+// Punctuation-only crumbs like `{`, `}`, `(`, `)` are common in code-shaped
+// queries but are useless for file-name fuzziness and can make the search
+// require impossible extra matches.
+fn is_useful_fuzzy_token(token: &str) -> bool {
+    token.chars().any(|c| c.is_ascii_alphanumeric())
+}
+
+fn build_file_query<'a>(query: &'a str) -> FFFQuery<'a> {
     let query = query.trim();
-    if query.is_empty() || query.chars().any(char::is_whitespace) {
-        return false;
+    if query.is_empty() {
+        return FFFQuery {
+            raw_query: query,
+            constraints: Vec::new(),
+            fuzzy_query: FuzzyQuery::Empty,
+            location: None,
+        };
     }
 
-    query
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    if should_parse_file_constraints(query) {
+        let parser = QueryParser::new(FileSearchConfig);
+        return parser.parse(query);
+    }
+
+    let fuzzy_parts: Vec<&str> = query
+        .split_whitespace()
+        .filter(|token| is_useful_fuzzy_token(token))
+        .collect();
+
+    let fuzzy_query = match fuzzy_parts.as_slice() {
+        [] => FuzzyQuery::Empty,
+        [single] => FuzzyQuery::Text(single),
+        parts => FuzzyQuery::Parts(parts.to_vec()),
+    };
+
+    FFFQuery {
+        raw_query: query,
+        constraints: Vec::new(),
+        fuzzy_query,
+        location: None,
+    }
 }
 
 // Resolve the git-status colour used for the row's left-edge bar.
@@ -319,19 +362,39 @@ fn execute_grep_search(
     abort_signal: Arc<AtomicBool>,
     grep_mode: GrepMode,
 ) -> (Vec<FileItemSnapshot>, usize, usize) {
-    let parsed = fff_search::grep::parse_grep_query(query);
-    let primary_mode = match grep_mode {
-        GrepMode::PlainText => {
-            if has_regex_metacharacters(query) {
-                GrepMode::Regex
+    let query = query.trim();
+    let fuzzy_query_text: String;
+    let parsed = match grep_mode {
+        GrepMode::Fuzzy => {
+            fuzzy_query_text = query
+                .split_whitespace()
+                .filter(|token| is_useful_fuzzy_token(token))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let fuzzy_query = if fuzzy_query_text.is_empty() {
+                FuzzyQuery::Empty
             } else {
-                GrepMode::PlainText
+                FuzzyQuery::Text(fuzzy_query_text.as_str())
+            };
+            FFFQuery {
+                raw_query: query,
+                constraints: Vec::new(),
+                fuzzy_query,
+                location: None,
             }
         }
+        _ => {
+            fuzzy_query_text = String::new();
+            fff_search::grep::parse_grep_query(query)
+        }
+    };
+    let primary_mode = match grep_mode {
+        GrepMode::PlainText => GrepMode::PlainText,
         GrepMode::Regex => GrepMode::Regex,
         GrepMode::Fuzzy => GrepMode::Fuzzy,
     };
 
+    let grep_started = Instant::now();
     let run = |mode| {
         picker.grep(
             &parsed,
@@ -340,6 +403,7 @@ fn execute_grep_search(
                 page_limit: 200,
                 max_matches_per_file: 5,
                 smart_case: true,
+                time_budget_ms: GREP_TIME_BUDGET_MS,
                 abort_signal: Some(abort_signal.clone()),
                 ..Default::default()
             },
@@ -386,6 +450,17 @@ fn execute_grep_search(
 
     let total_files_seen = grep_result.total_files.max(grep_result.filtered_file_count);
     let total_matched = items.len();
+    info!(
+        query = %query,
+        grep_mode = ?grep_mode,
+        primary_mode = ?primary_mode,
+        fuzzy_query = %fuzzy_query_text,
+        total_files = total_files_seen,
+        total_matched,
+        returned = items.len(),
+        elapsed = ?grep_started.elapsed(),
+        "grep search completed"
+    );
     (items, total_files_seen, total_matched)
 }
 
@@ -434,7 +509,6 @@ impl FffPicker {
             scan_done: false,
             search_epoch: 0,
             search_in_flight: false,
-            search_queued: false,
             search_abort: None,
             preview_epoch: 0,
             preview_loading: false,
@@ -460,16 +534,10 @@ impl FffPicker {
 
     // Close the popup when the window loses focus, matching Raycast-style dismissal.
     pub fn install_focus_lost_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let focus_handle = self.focus_handle.clone();
-        self.dismiss_on_blur =
-            Some(
-                cx.on_focus_out(&focus_handle, window, |_, _event, window, _cx| {
-                    window.remove_window();
-                }),
-            );
         self.dismiss_on_window_blur = Some(cx.on_focus_lost(window, |_, window, _cx| {
             window.remove_window();
         }));
+        self.dismiss_on_blur = None;
     }
 
     // Start the file indexer and trigger the initial search when indexing is ready.
@@ -613,15 +681,9 @@ impl FffPicker {
             return;
         }
 
-        if self.search_in_flight {
-            self.search_epoch = self.search_epoch.wrapping_add(1);
-            self.search_queued = true;
-            if let Some(abort) = &self.search_abort {
-                abort.store(true, Ordering::Release);
-            }
-            return;
+        if let Some(abort) = &self.search_abort {
+            abort.store(true, Ordering::Release);
         }
-
         self.search_epoch = self.search_epoch.wrapping_add(1);
         self.search_in_flight = true;
         let abort_signal = Arc::new(AtomicBool::new(false));
@@ -632,7 +694,7 @@ impl FffPicker {
         let query_str = self.query.clone();
         let view = self.view;
         let grep_mode = self.grep_mode;
-        debug!(
+        info!(
             epoch,
             query = %query_str.trim(),
             view = ?view,
@@ -655,8 +717,10 @@ impl FffPicker {
 
                     match view {
                         SearchView::Files => {
-                            let parser = QueryParser::new(FileSearchConfig);
-                            let parsed = parser.parse(&query);
+                            let file_search_started = Instant::now();
+                            let parse_started = Instant::now();
+                            let parsed = build_file_query(&query);
+                            let parse_elapsed = parse_started.elapsed();
                             let query_tracker = shared_query_tracker.read().ok();
                             let search = picker.fuzzy_search(
                                 &parsed,
@@ -674,6 +738,18 @@ impl FffPicker {
                                     },
                                     ..Default::default()
                                 },
+                            );
+                            info!(
+                                epoch,
+                                query = %query,
+                                query_mode = if parsed.constraints.is_empty() { "plain_fuzzy" } else { "file_filter" },
+                                constraints = parsed.constraints.len(),
+                                parse_elapsed = ?parse_elapsed,
+                                search_elapsed = ?file_search_started.elapsed(),
+                                total_files = search.total_files,
+                                total_matched = search.total_matched,
+                                returned = search.items.len(),
+                                "file search completed"
                             );
                             let fuzzy_items = search
                                 .items
@@ -696,158 +772,7 @@ impl FffPicker {
                                 })
                                 .collect::<Vec<_>>();
 
-                            if query.is_empty() {
-                                return (fuzzy_items, search.total_files, search.total_matched);
-                            }
-
-                            let grep_query = fff_search::grep::parse_grep_query(&query);
-                            let primary_mode = if has_regex_metacharacters(&query) {
-                                GrepMode::Regex
-                            } else {
-                                GrepMode::PlainText
-                            };
-
-                            let run_grep = |mode| {
-                                picker.grep(
-                                    &grep_query,
-                                    &GrepSearchOptions {
-                                        mode,
-                                        page_limit: 200,
-                                        max_matches_per_file: 5,
-                                        smart_case: true,
-                                        abort_signal: Some(abort_signal.clone()),
-                                        ..Default::default()
-                                    },
-                                )
-                            };
-
-                            let mut grep_result = run_grep(primary_mode);
-                            if grep_result.matches.is_empty() && primary_mode == GrepMode::PlainText
-                            {
-                                grep_result = run_grep(GrepMode::Fuzzy);
-                            }
-
-                            let allow_fuzzy_fallback = should_allow_fuzzy_fallback(&query);
-                            if !allow_fuzzy_fallback {
-                                let mut items: Vec<FileItemSnapshot> = Vec::new();
-                                let mut total_files_seen =
-                                    grep_result.total_files.max(grep_result.filtered_file_count);
-
-                                for gm in &grep_result.matches {
-                                    let Some(fi) = grep_result.files.get(gm.file_index) else {
-                                        continue;
-                                    };
-                                    if fi.is_binary() {
-                                        continue;
-                                    }
-                                    let absolute_path = fi.absolute_path(picker, &base);
-                                    let file_name = fi.file_name(picker);
-                                    let dir = fi.dir_str(picker);
-                                    items.push(FileItemSnapshot {
-                                        git_status: format_git_status_opt(fi.git_status)
-                                            .map(str::to_string),
-                                        frecency_score: fi.access_frecency_score,
-                                        match_ranges: find_match_ranges(&query, &file_name),
-                                        file_name,
-                                        dir,
-                                        absolute_path,
-                                        grep_matches: vec![GrepMatchLine {
-                                            line_number: gm.line_number,
-                                            line_content: gm.line_content.clone(),
-                                            byte_ranges: gm
-                                                .match_byte_offsets
-                                                .iter()
-                                                .copied()
-                                                .collect(),
-                                        }],
-                                    });
-                                }
-
-                                if items.is_empty() {
-                                    total_files_seen = search.total_files;
-                                }
-
-                                let total_matched = items.len();
-                                return (items, total_files_seen, total_matched);
-                            }
-
-                            let mut grep_by_path =
-                                std::collections::HashMap::<PathBuf, Vec<GrepMatchLine>>::new();
-                            let mut grep_order: Vec<PathBuf> = Vec::new();
-                            let mut grep_fi_index =
-                                std::collections::HashMap::<PathBuf, usize>::new();
-
-                            for gm in &grep_result.matches {
-                                let Some(fi) = grep_result.files.get(gm.file_index) else {
-                                    continue;
-                                };
-                                if fi.is_binary() {
-                                    continue;
-                                }
-                                let path = fi.absolute_path(picker, &base);
-                                if !grep_by_path.contains_key(&path) {
-                                    grep_order.push(path.clone());
-                                    grep_fi_index.insert(path.clone(), gm.file_index);
-                                }
-                                grep_by_path.entry(path).or_default().push(GrepMatchLine {
-                                    line_number: gm.line_number,
-                                    line_content: gm.line_content.clone(),
-                                    byte_ranges: gm.match_byte_offsets.iter().copied().collect(),
-                                });
-                            }
-
-                            if grep_order.is_empty() {
-                                return (fuzzy_items, search.total_files, search.total_matched);
-                            }
-
-                            let mut fuzzy_by_path: std::collections::HashMap<
-                                PathBuf,
-                                FileItemSnapshot,
-                            > = std::collections::HashMap::new();
-                            let mut fuzzy_order = Vec::with_capacity(fuzzy_items.len());
-                            for item in fuzzy_items {
-                                fuzzy_order.push(item.absolute_path.clone());
-                                fuzzy_by_path.insert(item.absolute_path.clone(), item);
-                            }
-
-                            let mut merged: Vec<FileItemSnapshot> = Vec::new();
-
-                            for path in &fuzzy_order {
-                                let Some(mut item) = fuzzy_by_path.remove(path) else {
-                                    continue;
-                                };
-                                if let Some(grep_matches) = grep_by_path.remove(path) {
-                                    item.grep_matches = grep_matches;
-                                }
-                                merged.push(item);
-                            }
-
-                            for path in &grep_order {
-                                let Some(grep_matches) = grep_by_path.remove(path) else {
-                                    continue;
-                                };
-                                let Some(&fi_idx) = grep_fi_index.get(path) else {
-                                    continue;
-                                };
-                                let Some(fi) = grep_result.files.get(fi_idx) else {
-                                    continue;
-                                };
-                                let file_name = fi.file_name(picker);
-                                let dir = fi.dir_str(picker);
-                                merged.push(FileItemSnapshot {
-                                    git_status: format_git_status_opt(fi.git_status)
-                                        .map(str::to_string),
-                                    frecency_score: fi.access_frecency_score,
-                                    match_ranges: find_match_ranges(&query, &file_name),
-                                    file_name,
-                                    dir,
-                                    absolute_path: path.clone(),
-                                    grep_matches,
-                                });
-                            }
-
-                            let total_matched = merged.len().max(search.total_matched);
-                            (merged, search.total_files, total_matched)
+                            (fuzzy_items, search.total_files, search.total_matched)
                         }
                         SearchView::Grep => {
                             if query.is_empty() {
@@ -863,7 +788,7 @@ impl FffPicker {
                 let update_result = this.update(cx, |this, cx| {
                     if this.search_epoch != epoch {
                         trace!(epoch, "discarding stale search result");
-                        this.finish_search(cx);
+                        this.finish_search(epoch, cx);
                         return;
                     }
                     debug!(
@@ -888,7 +813,16 @@ impl FffPicker {
                     }
                     this.load_preview(cx);
                     cx.notify();
-                    this.finish_search(cx);
+                    info!(
+                        epoch,
+                        view = ?this.view,
+                        query = %this.query,
+                        visible_results = this.results.len(),
+                        selected = this.selected,
+                        scan_done = this.scan_done,
+                        "search results applied"
+                    );
+                    this.finish_search(epoch, cx);
                     trace!(
                         epoch,
                         scan_done = this.scan_done,
@@ -906,19 +840,12 @@ impl FffPicker {
     }
 
     // Finish the active search and schedule any query that arrived while it was running.
-    fn finish_search(&mut self, cx: &mut Context<Self>) {
+    fn finish_search(&mut self, epoch: u64, _cx: &mut Context<Self>) {
+        if self.search_epoch != epoch {
+            return;
+        }
         self.search_in_flight = false;
         self.search_abort = None;
-        if self.search_queued {
-            self.search_queued = false;
-            let this = cx.entity().downgrade();
-            cx.defer(move |cx| {
-                this.update(cx, |this, cx| {
-                    this.run_search(cx);
-                })
-                .ok();
-            });
-        }
     }
 
     // Load and syntax-highlight the selected file preview in the background.
@@ -1326,6 +1253,7 @@ impl FffPicker {
     fn on_switch_grep(&mut self, _: &SwitchGrep, _window: &mut Window, cx: &mut Context<Self>) {
         if self.view != SearchView::Grep {
             self.view = SearchView::Grep;
+            self.grep_mode = GrepMode::PlainText;
             self.status_message = None;
             self.run_search(cx);
         }
