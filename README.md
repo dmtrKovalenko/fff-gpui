@@ -103,7 +103,7 @@ Set a keybind in `~/.config/fff-gpui/config.toml`:
 
 ```toml
 sync_zed_settings = true
-global_keybind = "cmd+shift+f"
+global_keybind = "hyper+f"
 window_width = 960.0
 window_height = 520.0
 picker_pane_width = 430.0
@@ -121,6 +121,8 @@ name = "One Dark"
 When `sync_zed_settings` is enabled, fff-gpui reads Zed's `settings.json` and mirrors the UI font, buffer font, UI and buffer font sizes, light/dark theme selection, and theme colors from the bundled Zed themes plus any installed or local Zed theme.
 
 Explicit config values still win, so you can keep Zed sync enabled and override just the theme, fonts, sizes, or specific colors in `config.toml` when needed. In practice that means `[theme].name` overrides Zed's chosen theme, and `[font]` overrides the synced font families and sizes.
+
+For `global_keybind`, `hyper` is accepted as a shorthand for `shift+control+alt+super`.
 
 Zed themes are discovered from the bundled Zed theme set, your local Zed installation, and extension themes under `~/Library/Application Support/Zed/extensions/installed/` on macOS.
 
