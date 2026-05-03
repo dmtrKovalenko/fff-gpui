@@ -269,6 +269,30 @@ fn register_global_hotkey(state: &mut RuntimeConfig, config: &AppConfig) {
     }
 }
 
+fn refresh_runtime_config(runtime_config: &Arc<Mutex<RuntimeConfig>>) -> (AppConfig, bool) {
+    let (config_path, current_config) = match runtime_config.lock() {
+        Ok(state) => (state.config_path.clone(), state.config.clone()),
+        Err(_) => return (AppConfig::default(), false),
+    };
+
+    let Ok(loaded) = config::load_config_from(&config_path) else {
+        return (current_config, false);
+    };
+
+    if loaded.config != current_config {
+        info!(
+            path = %config_path.display(),
+            "config changed on disk; refreshing runtime config"
+        );
+        if let Ok(mut state) = runtime_config.lock() {
+            state.config = loaded.config.clone();
+        }
+        (loaded.config, true)
+    } else {
+        (current_config, false)
+    }
+}
+
 fn open_config_file(runtime: &Arc<Mutex<RuntimeConfig>>) {
     let (path, config) = match runtime.lock() {
         Ok(state) => (state.config_path.clone(), state.config.clone()),
@@ -292,10 +316,13 @@ fn open_config_file(runtime: &Arc<Mutex<RuntimeConfig>>) {
 
 // Open the main picker window centered on the primary display.
 fn open_window(session: PickerSession, runtime_config: &Arc<Mutex<RuntimeConfig>>, cx: &mut App) {
-    let config = runtime_config
-        .lock()
-        .map(|state| state.config.clone())
-        .unwrap_or_default();
+    let (config, changed) = refresh_runtime_config(runtime_config);
+    if changed {
+        let _ = apply_key_bindings(cx, &config, true);
+        if let Ok(mut state) = runtime_config.lock() {
+            register_global_hotkey(&mut state, &config);
+        }
+    }
     theme::sync_from_config(&config, cx.window_appearance(), cx);
 
     let base_path = session.base_path;
