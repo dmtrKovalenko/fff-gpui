@@ -220,7 +220,10 @@ mod tests {
         };
         let s = serde_json::to_string(&cmd).unwrap();
         let back: ServiceCommand = serde_json::from_str(&s).unwrap();
-        assert!(matches!(back, ServiceCommand::OpenPath { in_grep: false, .. }));
+        assert!(matches!(
+            back,
+            ServiceCommand::OpenPath { in_grep: false, .. }
+        ));
     }
 
     #[test]
@@ -233,10 +236,7 @@ mod tests {
         ] {
             let s = serde_json::to_string(&cmd).unwrap();
             let back: ServiceCommand = serde_json::from_str(&s).unwrap();
-            assert_eq!(
-                std::mem::discriminant(&cmd),
-                std::mem::discriminant(&back)
-            );
+            assert_eq!(std::mem::discriminant(&cmd), std::mem::discriminant(&back));
         }
     }
 

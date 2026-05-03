@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use crate::assets::register_external_asset_path;
 use crate::config::{AppConfig, DEFAULT_PICKER_PANE_WIDTH};
 
 const DEFAULT_BG: u32 = 0x1C1C1E;
@@ -24,12 +25,12 @@ const DEFAULT_TEXT_DIM: u32 = 0x6C6C70;
 const DEFAULT_STATUS_BAR_BG: u32 = 0x18181A;
 const DEFAULT_MATCH_HIGHLIGHT: u32 = 0x4A9EFF;
 const DEFAULT_PREVIEW_BG: u32 = 0x161618;
-const DEFAULT_UI_FONT_FAMILY: &str = ".ZedSans";
-const DEFAULT_BUFFER_FONT_FAMILY: &str = ".ZedMono";
+const DEFAULT_UI_FONT_FAMILY: &str = ".SystemUIFont";
+const DEFAULT_BUFFER_FONT_FAMILY: &str = "UbuntuMono Nerd Font";
 pub const DEFAULT_UI_FONT_SIZE: f32 = 16.0;
 pub const DEFAULT_BUFFER_FONT_SIZE: f32 = 15.0;
-
 static ACTIVE_THEME: OnceLock<RwLock<AppTheme>> = OnceLock::new();
+static ACTIVE_FILE_ICON_THEME: OnceLock<RwLock<FileIconTheme>> = OnceLock::new();
 static THEME_VERSION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +50,8 @@ pub struct Palette {
     pub input_text: u32,
     pub cursor: u32,
     pub cursor_selection: u32,
+    pub icon_muted: u32,
+    pub icon_accent: u32,
     pub picker_pane_width: f32,
 }
 
@@ -69,6 +72,8 @@ pub struct AppTheme {
     pub input_text: u32,
     pub cursor: u32,
     pub cursor_selection: u32,
+    pub icon_muted: u32,
+    pub icon_accent: u32,
     pub ui_font_family: Option<String>,
     pub buffer_font_family: Option<String>,
     pub ui_font_size: f32,
@@ -105,6 +110,8 @@ impl Default for Palette {
             input_text: 0xE5E5EA,
             cursor: 0x0A84FF,
             cursor_selection: 0x0A84FF44,
+            icon_muted: DEFAULT_TEXT_SECONDARY,
+            icon_accent: DEFAULT_MATCH_HIGHLIGHT,
             picker_pane_width: DEFAULT_PICKER_PANE_WIDTH,
         }
     }
@@ -128,6 +135,8 @@ impl Default for AppTheme {
             input_text: 0xE5E5EA,
             cursor: 0x0A84FF,
             cursor_selection: 0x0A84FF44,
+            icon_muted: DEFAULT_TEXT_SECONDARY,
+            icon_accent: DEFAULT_MATCH_HIGHLIGHT,
             ui_font_family: Some(DEFAULT_UI_FONT_FAMILY.to_string()),
             buffer_font_family: Some(DEFAULT_BUFFER_FONT_FAMILY.to_string()),
             ui_font_size: DEFAULT_UI_FONT_SIZE,
@@ -148,14 +157,14 @@ impl AppTheme {
         }
 
         if syntax_capture_uses_variable_color(capture_name) {
-            return syntax_color_from_styles(&self.syntax_styles, "variable", self.syntax_default_color);
+            return syntax_color_from_styles(
+                &self.syntax_styles,
+                "variable",
+                self.syntax_default_color,
+            );
         }
 
-        syntax_color_from_styles(
-            &self.syntax_styles,
-            capture_name,
-            self.syntax_default_color,
-        )
+        syntax_color_from_styles(&self.syntax_styles, capture_name, self.syntax_default_color)
     }
 
     fn syntax_render_style(&self, capture_name: &str) -> SyntaxRenderStyle {
@@ -210,6 +219,8 @@ struct ZedSettings {
     #[serde(default)]
     theme: Option<ThemeSelection>,
     #[serde(default)]
+    icon_theme: Option<ThemeSelection>,
+    #[serde(default)]
     ui_font_family: Option<String>,
     #[serde(default)]
     buffer_font_family: Option<String>,
@@ -217,6 +228,28 @@ struct ZedSettings {
     ui_font_size: Option<f32>,
     #[serde(default)]
     buffer_font_size: Option<f32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IconThemeFamilyFile {
+    #[serde(default)]
+    themes: Vec<IconThemeVariant>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IconThemeVariant {
+    name: String,
+    #[serde(default)]
+    file_stems: HashMap<String, String>,
+    #[serde(default)]
+    file_suffixes: HashMap<String, String>,
+    #[serde(default)]
+    file_icons: HashMap<String, IconDefinitionContent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IconDefinitionContent {
+    path: SharedString,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -238,6 +271,24 @@ struct ExtensionManifest {
     themes: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileIconPath {
+    Embedded(SharedString),
+    External(SharedString),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FileIconDefinition {
+    path: FileIconPath,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FileIconTheme {
+    file_stems: HashMap<String, String>,
+    file_suffixes: HashMap<String, String>,
+    file_icons: HashMap<String, FileIconDefinition>,
+}
+
 const BUILTIN_THEME_FAMILIES: &[(&str, &str)] = &[
     (
         "vendor/zed/themes/ayu/ayu.json",
@@ -252,6 +303,357 @@ const BUILTIN_THEME_FAMILIES: &[(&str, &str)] = &[
         include_str!("../vendor/zed/themes/one/one.json"),
     ),
 ];
+
+const FILE_STEMS_BY_ICON_KEY: &[(&str, &[&str])] = &[
+    ("docker", &["Containerfile", "Dockerfile"]),
+    ("ruby", &["Podfile"]),
+    ("heroku", &["Procfile"]),
+];
+
+const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
+    ("astro", &["astro"]),
+    (
+        "audio",
+        &[
+            "aac", "flac", "m4a", "mka", "mp3", "ogg", "opus", "wav", "wma", "wv",
+        ],
+    ),
+    ("backup", &["bak"]),
+    ("bicep", &["bicep"]),
+    ("bun", &["lockb"]),
+    ("c", &["c", "h"]),
+    ("cairo", &["cairo"]),
+    ("code", &["handlebars", "metadata", "rkt", "scm"]),
+    ("coffeescript", &["coffee"]),
+    (
+        "cpp",
+        &[
+            "c++", "h++", "cc", "cpp", "cppm", "cxx", "hh", "hpp", "hxx", "inl", "ixx",
+        ],
+    ),
+    ("crystal", &["cr", "ecr"]),
+    ("csharp", &["cs"]),
+    ("csproj", &["csproj"]),
+    ("css", &["css", "pcss", "postcss"]),
+    ("cue", &["cue"]),
+    ("dart", &["dart"]),
+    ("diff", &["diff"]),
+    (
+        "docker",
+        &[
+            "docker-compose.yml",
+            "docker-compose.yaml",
+            "compose.yml",
+            "compose.yaml",
+        ],
+    ),
+    (
+        "document",
+        &[
+            "doc", "docx", "mdx", "odp", "ods", "odt", "pdf", "ppt", "pptx", "rtf", "txt", "xls",
+            "xlsx",
+        ],
+    ),
+    ("elixir", &["eex", "ex", "exs", "heex"]),
+    ("elm", &["elm"]),
+    (
+        "erlang",
+        &[
+            "Emakefile",
+            "app.src",
+            "erl",
+            "escript",
+            "hrl",
+            "rebar.config",
+            "xrl",
+            "yrl",
+        ],
+    ),
+    (
+        "eslint",
+        &[
+            "eslint.config.cjs",
+            "eslint.config.cts",
+            "eslint.config.js",
+            "eslint.config.mjs",
+            "eslint.config.mts",
+            "eslint.config.ts",
+            "eslintrc",
+            "eslintrc.js",
+            "eslintrc.json",
+        ],
+    ),
+    ("font", &["otf", "ttf", "woff", "woff2"]),
+    ("fsharp", &["fs"]),
+    ("fsproj", &["fsproj"]),
+    ("gitlab", &["gitlab-ci.yml", "gitlab-ci.yaml"]),
+    ("gleam", &["gleam"]),
+    ("go", &["go", "mod", "work"]),
+    ("graphql", &["gql", "graphql", "graphqls"]),
+    ("haskell", &["hs"]),
+    ("hcl", &["hcl"]),
+    (
+        "helm",
+        &[
+            "helmfile.yaml",
+            "helmfile.yml",
+            "Chart.yaml",
+            "Chart.yml",
+            "Chart.lock",
+            "values.yaml",
+            "values.yml",
+            "requirements.yaml",
+            "requirements.yml",
+            "tpl",
+        ],
+    ),
+    ("html", &["htm", "html"]),
+    (
+        "image",
+        &[
+            "avif", "bmp", "gif", "heic", "heif", "ico", "j2k", "jfif", "jp2", "jpeg", "jpg",
+            "jxl", "png", "psd", "qoi", "svg", "tiff", "webp",
+        ],
+    ),
+    ("ipynb", &["ipynb"]),
+    ("java", &["java"]),
+    ("javascript", &["cjs", "js", "mjs"]),
+    ("json", &["json", "jsonc"]),
+    ("julia", &["jl"]),
+    ("kdl", &["kdl"]),
+    ("kotlin", &["kt"]),
+    ("lock", &["lock"]),
+    ("log", &["log"]),
+    ("lua", &["lua"]),
+    ("luau", &["luau"]),
+    ("markdown", &["markdown", "md"]),
+    ("metal", &["metal"]),
+    ("nim", &["nim", "nims", "nimble"]),
+    ("nix", &["nix"]),
+    ("ocaml", &["ml", "mli"]),
+    ("odin", &["odin"]),
+    ("php", &["php"]),
+    (
+        "prettier",
+        &[
+            "prettier.config.cjs",
+            "prettier.config.js",
+            "prettier.config.mjs",
+            "prettierignore",
+            "prettierrc",
+            "prettierrc.cjs",
+            "prettierrc.js",
+            "prettierrc.json",
+            "prettierrc.json5",
+            "prettierrc.mjs",
+            "prettierrc.toml",
+            "prettierrc.yaml",
+            "prettierrc.yml",
+        ],
+    ),
+    ("prisma", &["prisma"]),
+    ("puppet", &["pp"]),
+    ("python", &["py"]),
+    ("r", &["r", "R"]),
+    ("react", &["cjsx", "ctsx", "jsx", "mjsx", "mtsx", "tsx"]),
+    ("roc", &["roc"]),
+    ("ruby", &["rb"]),
+    ("rust", &["rs"]),
+    ("sass", &["sass", "scss"]),
+    ("scala", &["scala", "sc"]),
+    ("settings", &["conf", "ini"]),
+    ("solidity", &["sol"]),
+    (
+        "storage",
+        &[
+            "accdb", "csv", "dat", "db", "dbf", "dll", "fmp", "fp7", "frm", "gdb", "ib", "ldf",
+            "mdb", "mdf", "myd", "myi", "pdb", "RData", "rdata", "sav", "sdf", "sql", "sqlite",
+            "tsv",
+        ],
+    ),
+    (
+        "stylelint",
+        &[
+            "stylelint.config.cjs",
+            "stylelint.config.js",
+            "stylelint.config.mjs",
+            "stylelintignore",
+            "stylelintrc",
+            "stylelintrc.cjs",
+            "stylelintrc.js",
+            "stylelintrc.json",
+            "stylelintrc.mjs",
+            "stylelintrc.yaml",
+            "stylelintrc.yml",
+        ],
+    ),
+    ("surrealql", &["surql"]),
+    ("svelte", &["svelte"]),
+    ("swift", &["swift"]),
+    ("tcl", &["tcl"]),
+    ("template", &["hbs", "plist", "xml"]),
+    (
+        "terminal",
+        &[
+            "bash",
+            "bash_aliases",
+            "bash_login",
+            "bash_logout",
+            "bash_profile",
+            "bashrc",
+            "fish",
+            "nu",
+            "profile",
+            "ps1",
+            "sh",
+            "zlogin",
+            "zlogout",
+            "zprofile",
+            "zsh",
+            "zsh_aliases",
+            "zsh_histfile",
+            "zsh_history",
+            "zshenv",
+            "zshrc",
+        ],
+    ),
+    ("terraform", &["tf", "tfvars"]),
+    ("toml", &["toml"]),
+    ("typescript", &["cts", "mts", "ts"]),
+    ("v", &["v", "vsh", "vv"]),
+    (
+        "vcs",
+        &[
+            "COMMIT_EDITMSG",
+            "EDIT_DESCRIPTION",
+            "MERGE_MSG",
+            "NOTES_EDITMSG",
+            "TAG_EDITMSG",
+            "gitattributes",
+            "gitignore",
+            "gitkeep",
+            "gitmodules",
+        ],
+    ),
+    ("vbproj", &["vbproj"]),
+    ("video", &["avi", "m4v", "mkv", "mov", "mp4", "webm", "wmv"]),
+    ("vs_sln", &["sln"]),
+    ("vs_suo", &["suo"]),
+    ("vue", &["vue"]),
+    ("vyper", &["vy", "vyi"]),
+    ("wgsl", &["wgsl"]),
+    ("yaml", &["yaml", "yml"]),
+    ("zig", &["zig"]),
+];
+
+const FILE_ICONS: &[(&str, &str)] = &[
+    ("astro", "file_icons/astro.svg"),
+    ("audio", "file_icons/audio.svg"),
+    ("bicep", "file_icons/file.svg"),
+    ("bun", "file_icons/bun.svg"),
+    ("c", "file_icons/c.svg"),
+    ("cairo", "file_icons/cairo.svg"),
+    ("code", "file_icons/code.svg"),
+    ("coffeescript", "file_icons/coffeescript.svg"),
+    ("cpp", "file_icons/cpp.svg"),
+    ("crystal", "file_icons/file.svg"),
+    ("csharp", "file_icons/file.svg"),
+    ("csproj", "file_icons/file.svg"),
+    ("css", "file_icons/css.svg"),
+    ("cue", "file_icons/file.svg"),
+    ("dart", "file_icons/dart.svg"),
+    ("default", "file_icons/file.svg"),
+    ("diff", "file_icons/diff.svg"),
+    ("docker", "file_icons/docker.svg"),
+    ("document", "file_icons/book.svg"),
+    ("elixir", "file_icons/elixir.svg"),
+    ("elm", "file_icons/elm.svg"),
+    ("erlang", "file_icons/erlang.svg"),
+    ("eslint", "file_icons/eslint.svg"),
+    ("font", "file_icons/font.svg"),
+    ("fsharp", "file_icons/fsharp.svg"),
+    ("fsproj", "file_icons/file.svg"),
+    ("gitlab", "file_icons/gitlab.svg"),
+    ("gleam", "file_icons/gleam.svg"),
+    ("go", "file_icons/go.svg"),
+    ("graphql", "file_icons/graphql.svg"),
+    ("haskell", "file_icons/haskell.svg"),
+    ("hcl", "file_icons/hcl.svg"),
+    ("helm", "file_icons/helm.svg"),
+    ("heroku", "file_icons/heroku.svg"),
+    ("html", "file_icons/html.svg"),
+    ("image", "file_icons/image.svg"),
+    ("ipynb", "file_icons/jupyter.svg"),
+    ("java", "file_icons/java.svg"),
+    ("javascript", "file_icons/javascript.svg"),
+    ("json", "file_icons/code.svg"),
+    ("julia", "file_icons/julia.svg"),
+    ("kdl", "file_icons/kdl.svg"),
+    ("kotlin", "file_icons/kotlin.svg"),
+    ("lock", "file_icons/lock.svg"),
+    ("log", "file_icons/info.svg"),
+    ("lua", "file_icons/lua.svg"),
+    ("luau", "file_icons/luau.svg"),
+    ("markdown", "file_icons/book.svg"),
+    ("metal", "file_icons/metal.svg"),
+    ("nim", "file_icons/nim.svg"),
+    ("nix", "file_icons/nix.svg"),
+    ("ocaml", "file_icons/ocaml.svg"),
+    ("odin", "file_icons/odin.svg"),
+    ("phoenix", "file_icons/phoenix.svg"),
+    ("php", "file_icons/php.svg"),
+    ("prettier", "file_icons/prettier.svg"),
+    ("prisma", "file_icons/prisma.svg"),
+    ("puppet", "file_icons/puppet.svg"),
+    ("python", "file_icons/python.svg"),
+    ("r", "file_icons/r.svg"),
+    ("react", "file_icons/react.svg"),
+    ("roc", "file_icons/roc.svg"),
+    ("ruby", "file_icons/ruby.svg"),
+    ("rust", "file_icons/rust.svg"),
+    ("sass", "file_icons/sass.svg"),
+    ("scala", "file_icons/scala.svg"),
+    ("settings", "file_icons/settings.svg"),
+    ("solidity", "file_icons/file.svg"),
+    ("storage", "file_icons/database.svg"),
+    ("stylelint", "file_icons/javascript.svg"),
+    ("surrealql", "file_icons/surrealql.svg"),
+    ("svelte", "file_icons/html.svg"),
+    ("swift", "file_icons/swift.svg"),
+    ("tcl", "file_icons/tcl.svg"),
+    ("template", "file_icons/html.svg"),
+    ("terminal", "file_icons/terminal.svg"),
+    ("terraform", "file_icons/terraform.svg"),
+    ("toml", "file_icons/toml.svg"),
+    ("typescript", "file_icons/typescript.svg"),
+    ("v", "file_icons/v.svg"),
+    ("vbproj", "file_icons/file.svg"),
+    ("vcs", "file_icons/git.svg"),
+    ("video", "file_icons/video.svg"),
+    ("vs_sln", "file_icons/file.svg"),
+    ("vs_suo", "file_icons/file.svg"),
+    ("vue", "file_icons/vue.svg"),
+    ("vyper", "file_icons/vyper.svg"),
+    ("wgsl", "file_icons/wgsl.svg"),
+    ("yaml", "file_icons/yaml.svg"),
+    ("zig", "file_icons/zig.svg"),
+];
+
+/// The name of the default icon theme.
+const DEFAULT_ICON_THEME_NAME: &str = "Zed (Default)";
+
+fn icon_keys_by_association(
+    associations_by_icon_key: &[(&str, &[&str])],
+) -> HashMap<String, String> {
+    let mut icon_keys_by_association = HashMap::default();
+    for (icon_key, associations) in associations_by_icon_key {
+        for association in *associations {
+            icon_keys_by_association.insert(association.to_string(), icon_key.to_string());
+        }
+    }
+
+    icon_keys_by_association
+}
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 pub struct SyntaxStyle {
@@ -305,6 +707,8 @@ pub fn palette() -> Palette {
         input_text: theme.input_text,
         cursor: theme.cursor,
         cursor_selection: theme.cursor_selection,
+        icon_muted: theme.icon_muted,
+        icon_accent: theme.icon_accent,
         picker_pane_width: theme.picker_pane_width,
     }
 }
@@ -343,20 +747,38 @@ pub fn sync_from_config(config: &AppConfig, appearance: WindowAppearance, cx: &m
     } else {
         None
     };
-
-    let mut resolved = if config.sync_zed_settings {
-        match theme_catalog.as_ref() {
-            Some(catalog) => match resolve_from_zed_settings(appearance, catalog) {
-                Ok(theme) => theme,
-                Err(err) => {
-                    warn!(error = %err, "failed to sync Zed theme settings; falling back to defaults");
-                    AppTheme::default()
-                }
-            },
-            None => AppTheme::default(),
+    let icon_theme_catalog = if config.sync_zed_settings {
+        match load_icon_theme_catalog() {
+            Ok(catalog) => Some(catalog),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to load icon theme catalog; falling back to defaults"
+                );
+                None
+            }
         }
     } else {
-        AppTheme::default()
+        None
+    };
+
+    let (mut resolved, resolved_icon_theme) = if config.sync_zed_settings {
+        match resolve_from_zed_settings(
+            appearance,
+            theme_catalog.as_ref(),
+            icon_theme_catalog.as_ref(),
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to sync Zed theme settings; falling back to defaults"
+                );
+                (AppTheme::default(), default_file_icon_theme())
+            }
+        }
+    } else {
+        (AppTheme::default(), default_file_icon_theme())
     };
 
     if let Some(catalog) = theme_catalog.as_ref()
@@ -397,16 +819,27 @@ pub fn sync_from_config(config: &AppConfig, appearance: WindowAppearance, cx: &m
     apply_color(&config.theme.text_dim, &mut resolved.text_dim);
     apply_color(&config.theme.status_bar_bg, &mut resolved.status_bar_bg);
     apply_color(&config.theme.match_highlight, &mut resolved.match_highlight);
-    apply_color(&config.theme.match_highlight_bg, &mut resolved.match_highlight_bg);
+    apply_color(
+        &config.theme.match_highlight_bg,
+        &mut resolved.match_highlight_bg,
+    );
     apply_color(&config.theme.preview_bg, &mut resolved.preview_bg);
     apply_color(&config.theme.input_bg, &mut resolved.input_bg);
     apply_color(&config.theme.input_text, &mut resolved.input_text);
     apply_color(&config.theme.cursor, &mut resolved.cursor);
-    apply_color(&config.theme.cursor_selection, &mut resolved.cursor_selection);
+    apply_color(
+        &config.theme.cursor_selection,
+        &mut resolved.cursor_selection,
+    );
+    apply_color(&config.theme.icon_muted, &mut resolved.icon_muted);
+    apply_color(&config.theme.icon_accent, &mut resolved.icon_accent);
 
     cx.set_global(resolved.clone());
     if let Ok(mut guard) = active_theme_lock().write() {
         *guard = resolved;
+    }
+    if let Ok(mut guard) = active_file_icon_theme_lock().write() {
+        *guard = resolved_icon_theme;
     }
     THEME_VERSION.fetch_add(1, Ordering::SeqCst);
 
@@ -437,6 +870,10 @@ fn zed_local_themes_dir() -> PathBuf {
     zed_config_dir().join("themes")
 }
 
+fn zed_icon_themes_dir() -> PathBuf {
+    zed_config_dir().join("icon_themes")
+}
+
 fn zed_installed_themes_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -464,42 +901,78 @@ fn read_to_string(path: &Path) -> Result<String> {
 }
 
 fn load_zed_settings() -> Result<ZedSettings> {
+    let defaults = hardcoded_zed_settings_defaults();
     let path = zed_settings_path();
     if !path.exists() {
-        return Ok(ZedSettings::default());
+        return Ok(defaults);
     }
 
     let contents = read_to_string(&path)?;
-    json5::from_str(&contents)
-        .with_context(|| format!("failed to parse JSON from {}", path.display()))
+    if contents.trim().is_empty() {
+        return Ok(defaults);
+    }
+
+    let mut settings: ZedSettings = json5::from_str(&contents)
+        .with_context(|| format!("failed to parse JSON from {}", path.display()))?;
+    merge_zed_settings(&mut settings, defaults);
+    Ok(settings)
+}
+
+fn hardcoded_zed_settings_defaults() -> ZedSettings {
+    ZedSettings {
+        theme: Some(ThemeSelection::Dynamic {
+            mode: ThemeMode::System,
+            light: "One Light".to_string(),
+            dark: "One Dark".to_string(),
+        }),
+        icon_theme: Some(ThemeSelection::Static("Zed (Default)".to_string())),
+        ui_font_family: Some(DEFAULT_UI_FONT_FAMILY.to_string()),
+        buffer_font_family: Some(DEFAULT_BUFFER_FONT_FAMILY.to_string()),
+        ui_font_size: Some(DEFAULT_UI_FONT_SIZE),
+        buffer_font_size: Some(DEFAULT_BUFFER_FONT_SIZE),
+    }
+}
+
+fn merge_zed_settings(settings: &mut ZedSettings, defaults: ZedSettings) {
+    if settings.theme.is_none() {
+        settings.theme = defaults.theme;
+    }
+    if settings.icon_theme.is_none() {
+        settings.icon_theme = defaults.icon_theme;
+    }
+    if settings.ui_font_family.is_none() {
+        settings.ui_font_family = defaults.ui_font_family;
+    }
+    if settings.buffer_font_family.is_none() {
+        settings.buffer_font_family = defaults.buffer_font_family;
+    }
+    if settings.ui_font_size.is_none() {
+        settings.ui_font_size = defaults.ui_font_size;
+    }
+    if settings.buffer_font_size.is_none() {
+        settings.buffer_font_size = defaults.buffer_font_size;
+    }
 }
 
 fn resolve_from_zed_settings(
     appearance: WindowAppearance,
-    catalog: &HashMap<String, ThemeCatalogEntry>,
-) -> Result<AppTheme> {
+    theme_catalog: Option<&HashMap<String, ThemeCatalogEntry>>,
+    icon_theme_catalog: Option<&HashMap<String, FileIconTheme>>,
+) -> Result<(AppTheme, FileIconTheme)> {
     let settings = load_zed_settings()?;
-    let ui_font_family = SharedString::from(
-        settings
-            .ui_font_family
-            .unwrap_or_else(|| DEFAULT_UI_FONT_FAMILY.to_string()),
-    );
-    let buffer_font_family = SharedString::from(
-        settings
-            .buffer_font_family
-            .unwrap_or_else(|| DEFAULT_BUFFER_FONT_FAMILY.to_string()),
-    );
-    let resolved_name = settings
-        .theme
-        .as_ref()
-        .map(|theme| resolve_theme_name(theme, appearance));
 
     let mut theme = AppTheme::default();
-    if let Some(name) = resolved_name {
-        if let Some(entry) = catalog.get(&normalize_name(&name)) {
-            apply_catalog_entry(entry, &mut theme);
-        } else {
-            warn!(theme = %name, "Zed theme not found; using built-in fallback theme");
+    if let Some(name) = settings
+        .theme
+        .as_ref()
+        .map(|theme| resolve_theme_name(theme, appearance))
+    {
+        if let Some(catalog) = theme_catalog {
+            if let Some(entry) = catalog.get(&normalize_name(&name)) {
+                apply_catalog_entry(entry, &mut theme);
+            } else {
+                warn!(theme = %name, "Zed theme not found; using built-in fallback theme");
+            }
         }
     } else {
         debug!(
@@ -508,12 +981,43 @@ fn resolve_from_zed_settings(
         );
     }
 
-    theme.ui_font_family = Some(ui_font_family.to_string());
-    theme.buffer_font_family = Some(buffer_font_family.to_string());
+    theme.ui_font_family = Some(
+        settings
+            .ui_font_family
+            .unwrap_or_else(|| DEFAULT_UI_FONT_FAMILY.to_string()),
+    );
+    theme.buffer_font_family = Some(
+        settings
+            .buffer_font_family
+            .unwrap_or_else(|| DEFAULT_BUFFER_FONT_FAMILY.to_string()),
+    );
     theme.ui_font_size = settings.ui_font_size.unwrap_or(DEFAULT_UI_FONT_SIZE);
-    theme.buffer_font_size = settings.buffer_font_size.unwrap_or(DEFAULT_BUFFER_FONT_SIZE);
+    theme.buffer_font_size = settings
+        .buffer_font_size
+        .unwrap_or(DEFAULT_BUFFER_FONT_SIZE);
 
-    Ok(theme)
+    if let Some(icon_name) = settings
+        .icon_theme
+        .as_ref()
+        .map(|selection| resolve_theme_name(selection, appearance))
+    {
+        let resolved_icon_theme = icon_theme_catalog
+            .and_then(|catalog| catalog.get(&normalize_name(&icon_name)).cloned())
+            .unwrap_or_else(|| {
+                warn!(
+                    icon_theme = %icon_name,
+                    "Zed icon theme not found; using built-in default icons"
+                );
+                default_file_icon_theme()
+            });
+        Ok((theme, resolved_icon_theme))
+    } else {
+        debug!(
+            settings_path = %zed_settings_path().display(),
+            "no Zed icon theme configured; using built-in default icons"
+        );
+        Ok((theme, default_file_icon_theme()))
+    }
 }
 
 fn resolve_theme_name(selection: &ThemeSelection, appearance: WindowAppearance) -> String {
@@ -530,12 +1034,255 @@ fn resolve_theme_name(selection: &ThemeSelection, appearance: WindowAppearance) 
     }
 }
 
+fn active_file_icon_theme_lock() -> &'static RwLock<FileIconTheme> {
+    ACTIVE_FILE_ICON_THEME.get_or_init(|| RwLock::new(default_file_icon_theme()))
+}
+
+fn default_file_icon_theme() -> FileIconTheme {
+    let file_stems = icon_keys_by_association(FILE_STEMS_BY_ICON_KEY);
+    let file_suffixes = icon_keys_by_association(FILE_SUFFIXES_BY_ICON_KEY);
+    let file_icons = HashMap::from_iter(FILE_ICONS.iter().map(|(ty, path)| {
+        (
+            ty.to_string(),
+            FileIconDefinition {
+                path: FileIconPath::Embedded((*path).into()),
+            },
+        )
+    }));
+
+    FileIconTheme {
+        file_stems,
+        file_suffixes,
+        file_icons,
+    }
+}
+
+fn current_file_icon_theme() -> FileIconTheme {
+    match active_file_icon_theme_lock().read() {
+        Ok(theme) => theme.clone(),
+        Err(_) => default_file_icon_theme(),
+    }
+}
+
+pub fn file_icon_for_path(path: &Path) -> Option<FileIconPath> {
+    let theme = current_file_icon_theme();
+    theme.file_icon_for_path(path)
+}
+
+impl FileIconTheme {
+    fn file_icon_for_path(&self, path: &Path) -> Option<FileIconPath> {
+        let get_icon_from_suffix = |suffix: &str| -> Option<FileIconPath> {
+            self.file_stems
+                .get(suffix)
+                .or_else(|| self.file_suffixes.get(suffix))
+                .and_then(|typ| self.get_icon_for_type(typ))
+        };
+
+        if let Some(mut typ) = path.file_name().and_then(|typ| typ.to_str()) {
+            let maybe_path = get_icon_from_suffix(typ);
+            if maybe_path.is_some() {
+                return maybe_path;
+            }
+
+            while let Some((_, suffix)) = typ.split_once('.') {
+                let maybe_path = get_icon_from_suffix(suffix);
+                if maybe_path.is_some() {
+                    return maybe_path;
+                }
+                typ = suffix;
+            }
+        }
+
+        if let Some(suffix) = multiple_extensions(path) {
+            let maybe_path = get_icon_from_suffix(&suffix);
+            if maybe_path.is_some() {
+                return maybe_path;
+            }
+        }
+
+        if let Some(suffix) = extension_or_hidden_file_name(path) {
+            let maybe_path = get_icon_from_suffix(&suffix);
+            if maybe_path.is_some() {
+                return maybe_path;
+            }
+        }
+
+        if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
+            let maybe_path = get_icon_from_suffix(extension);
+            if maybe_path.is_some() {
+                return maybe_path;
+            }
+        }
+
+        self.get_icon_for_type("default")
+    }
+
+    fn get_icon_for_type(&self, typ: &str) -> Option<FileIconPath> {
+        self.file_icons
+            .get(typ)
+            .map(|icon_definition| icon_definition.path.clone())
+    }
+}
+
+fn multiple_extensions(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let mut parts = file_name.split('.');
+    let _ = parts.next()?;
+    let _ = parts.next()?;
+    let mut suffix = String::new();
+    for part in file_name.split('.').skip(1) {
+        if !suffix.is_empty() {
+            suffix.push('.');
+        }
+        suffix.push_str(part);
+    }
+    (!suffix.is_empty()).then_some(suffix)
+}
+
+fn extension_or_hidden_file_name(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    if file_name.starts_with('.') && file_name.len() > 1 {
+        let hidden = file_name.trim_start_matches('.');
+        if !hidden.is_empty() {
+            return Some(hidden.to_string());
+        }
+    }
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(ToOwned::to_owned)
+}
+
 fn load_theme_catalog() -> Result<HashMap<String, ThemeCatalogEntry>> {
     let mut catalog = HashMap::new();
     load_builtin_theme_catalog(&mut catalog)?;
     load_installed_theme_catalog(&mut catalog)?;
     load_local_theme_catalog(&mut catalog)?;
     Ok(catalog)
+}
+
+fn load_icon_theme_catalog() -> Result<HashMap<String, FileIconTheme>> {
+    let mut catalog = HashMap::new();
+    load_builtin_icon_theme_catalog(&mut catalog)?;
+    load_installed_icon_theme_catalog(&mut catalog)?;
+    load_local_icon_theme_catalog(&mut catalog)?;
+    Ok(catalog)
+}
+
+fn load_builtin_icon_theme_catalog(catalog: &mut HashMap<String, FileIconTheme>) -> Result<()> {
+    catalog.insert(
+        normalize_name(DEFAULT_ICON_THEME_NAME),
+        default_file_icon_theme(),
+    );
+    Ok(())
+}
+
+fn load_local_icon_theme_catalog(catalog: &mut HashMap<String, FileIconTheme>) -> Result<()> {
+    let dir = zed_icon_themes_dir();
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(&dir)
+        .with_context(|| format!("reading local Zed icon themes from {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        load_icon_theme_family_file(&path, &zed_config_dir(), catalog)?;
+    }
+
+    Ok(())
+}
+
+fn load_installed_icon_theme_catalog(catalog: &mut HashMap<String, FileIconTheme>) -> Result<()> {
+    let dir = zed_installed_themes_dir();
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(&dir)
+        .with_context(|| format!("reading installed Zed icon themes from {}", dir.display()))?
+    {
+        let entry = entry?;
+        let extension_dir = entry.path();
+        if !extension_dir.is_dir() {
+            continue;
+        }
+
+        let icon_theme_dir = extension_dir.join("icon_themes");
+        if !icon_theme_dir.exists() {
+            continue;
+        }
+
+        for icon_theme_entry in fs::read_dir(&icon_theme_dir)
+            .with_context(|| format!("reading icon themes from {}", icon_theme_dir.display()))?
+        {
+            let icon_theme_entry = icon_theme_entry?;
+            let icon_theme_path = icon_theme_entry.path();
+            if icon_theme_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            load_icon_theme_family_file(&icon_theme_path, &extension_dir, catalog)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn load_icon_theme_family_file(
+    path: &Path,
+    icons_root_dir: &Path,
+    catalog: &mut HashMap<String, FileIconTheme>,
+) -> Result<()> {
+    let contents = read_to_string(path)?;
+    load_icon_theme_family_contents(
+        &path.display().to_string(),
+        &contents,
+        icons_root_dir,
+        catalog,
+    )
+}
+
+fn load_icon_theme_family_contents(
+    label: &str,
+    contents: &str,
+    icons_root_dir: &Path,
+    catalog: &mut HashMap<String, FileIconTheme>,
+) -> Result<()> {
+    let family: IconThemeFamilyFile =
+        json5::from_str(contents).with_context(|| format!("failed to parse JSON from {label}"))?;
+
+    for variant in family.themes {
+        let theme_key = normalize_name(&variant.name);
+        let mut theme = default_file_icon_theme();
+        apply_icon_theme_variant(&variant, icons_root_dir, &mut theme);
+        catalog.insert(theme_key, theme);
+    }
+
+    Ok(())
+}
+
+fn apply_icon_theme_variant(
+    variant: &IconThemeVariant,
+    icons_root_dir: &Path,
+    theme: &mut FileIconTheme,
+) {
+    theme.file_stems.extend(variant.file_stems.clone());
+    theme.file_suffixes.extend(variant.file_suffixes.clone());
+    theme
+        .file_icons
+        .extend(variant.file_icons.iter().map(|(key, icon)| {
+            let resolved_path = icons_root_dir.join(icon.path.as_ref());
+            let asset_path = register_external_asset_path(resolved_path);
+            (
+                key.clone(),
+                FileIconDefinition {
+                    path: FileIconPath::External(asset_path),
+                },
+            )
+        }));
 }
 
 fn load_builtin_theme_catalog(catalog: &mut HashMap<String, ThemeCatalogEntry>) -> Result<()> {
@@ -624,8 +1371,8 @@ fn load_theme_family_contents(
     contents: &str,
     catalog: &mut HashMap<String, ThemeCatalogEntry>,
 ) -> Result<()> {
-    let family: ThemeFamilyFile = json5::from_str(contents)
-        .with_context(|| format!("failed to parse JSON from {label}"))?;
+    let family: ThemeFamilyFile =
+        json5::from_str(contents).with_context(|| format!("failed to parse JSON from {label}"))?;
 
     for variant in family.themes {
         let theme_key = normalize_name(&variant.name);
@@ -643,7 +1390,11 @@ fn load_theme_family_contents(
     Ok(())
 }
 
-fn apply_named_theme(name: &str, catalog: &HashMap<String, ThemeCatalogEntry>, theme: &mut AppTheme) {
+fn apply_named_theme(
+    name: &str,
+    catalog: &HashMap<String, ThemeCatalogEntry>,
+    theme: &mut AppTheme,
+) {
     if let Some(entry) = catalog.get(&normalize_name(name)) {
         apply_catalog_entry(entry, theme);
     } else {
@@ -667,6 +1418,8 @@ fn apply_catalog_entry(entry: &ThemeCatalogEntry, theme: &mut AppTheme) {
     theme.input_text = entry.palette.input_text;
     theme.cursor = entry.palette.cursor;
     theme.cursor_selection = entry.palette.cursor_selection;
+    theme.icon_muted = entry.palette.icon_muted;
+    theme.icon_accent = entry.palette.icon_accent;
     theme.syntax_styles = entry.syntax_styles.clone();
     theme.syntax_default_color = entry.syntax_default_color;
 }
@@ -731,6 +1484,13 @@ fn palette_from_style(style: &Value) -> Palette {
         cursor: color_from_style(style, "editor.cursor").unwrap_or(0x0A84FF),
         cursor_selection: color_from_style(style, "editor.selectionBackground")
             .unwrap_or(0x0A84FF44),
+        icon_muted: color_from_style(style, "icon.muted")
+            .or_else(|| color_from_style(style, "icon.placeholder"))
+            .or_else(|| color_from_style(style, "text.muted"))
+            .unwrap_or(DEFAULT_TEXT_SECONDARY),
+        icon_accent: color_from_style(style, "icon.accent")
+            .or_else(|| color_from_style(style, "text.accent"))
+            .unwrap_or(DEFAULT_MATCH_HIGHLIGHT),
         picker_pane_width: DEFAULT_PICKER_PANE_WIDTH,
     }
 }
@@ -763,7 +1523,11 @@ fn syntax_color_from_styles(
     for (index, (token, style)) in styles.iter().enumerate() {
         let mut specificity = 0;
         if syntax_token_matches_capture(token, capture_name, &mut specificity) {
-            let candidate = (specificity, index, syntax_style_color(style).unwrap_or(default_color));
+            let candidate = (
+                specificity,
+                index,
+                syntax_style_color(style).unwrap_or(default_color),
+            );
             if best_match.as_ref().is_none_or(|best| candidate > *best) {
                 best_match = Some(candidate);
             }
@@ -780,7 +1544,9 @@ fn syntax_style_for_capture(styles: &[(String, SyntaxStyle)], capture_name: &str
         let mut specificity = 0;
         if syntax_token_matches_capture(token, capture_name, &mut specificity) {
             let candidate = (specificity, index, style.clone());
-            if best_match.as_ref().is_none_or(|best| candidate.0 > best.0 || (candidate.0 == best.0 && candidate.1 > best.1)) {
+            if best_match.as_ref().is_none_or(|best| {
+                candidate.0 > best.0 || (candidate.0 == best.0 && candidate.1 > best.1)
+            }) {
                 best_match = Some(candidate);
             }
         }
@@ -793,16 +1559,15 @@ fn syntax_style_color(style: &SyntaxStyle) -> Option<u32> {
     style.color.as_deref().and_then(parse_color_rgb)
 }
 
-fn syntax_token_matches_capture(
-    token: &str,
-    capture_name: &str,
-    specificity: &mut usize,
-) -> bool {
+fn syntax_token_matches_capture(token: &str, capture_name: &str, specificity: &mut usize) -> bool {
     let capture_parts: Vec<&str> = capture_name.split('.').collect();
     let mut matched_parts = 0;
 
     for token_part in token.split('.') {
-        if capture_parts.iter().any(|capture_part| capture_part == &token_part) {
+        if capture_parts
+            .iter()
+            .any(|capture_part| capture_part == &token_part)
+        {
             matched_parts += 1;
         } else {
             return false;
@@ -814,8 +1579,7 @@ fn syntax_token_matches_capture(
 }
 
 fn syntax_capture_is_punctuation(capture_name: &str) -> bool {
-    matches!(capture_name, "punctuation" | "operator")
-        || capture_name.starts_with("punctuation.")
+    matches!(capture_name, "punctuation" | "operator") || capture_name.starts_with("punctuation.")
 }
 
 fn syntax_capture_uses_variable_color(capture_name: &str) -> bool {

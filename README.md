@@ -109,8 +109,8 @@ window_height = 520.0
 picker_pane_width = 430.0
 
 [font]
-ui_family = ".ZedSans"
-buffer_family = ".ZedMono"
+ui_family = ".SystemUIFont"
+buffer_family = "UbuntuMono Nerd Font"
 ui_size = 16.0
 buffer_size = 15.0
 

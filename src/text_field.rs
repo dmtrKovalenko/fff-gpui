@@ -9,8 +9,8 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::theme::AppTheme;
 use crate::theme;
+use crate::theme::AppTheme;
 
 actions!(
     fff_text_field,

@@ -75,6 +75,10 @@ pub struct ThemeConfig {
     pub cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_selection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_muted: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_accent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -57,13 +57,7 @@ mod tests {
 
     #[test]
     fn expands_hyper_into_all_modifiers() {
-        assert_eq!(
-            expand_hyper("hyper+f"),
-            "shift+control+alt+super+f"
-        );
-        assert_eq!(
-            expand_hyper("cmd-hyper-f"),
-            "cmd+shift+control+alt+super+f"
-        );
+        assert_eq!(expand_hyper("hyper+f"), "shift+control+alt+super+f");
+        assert_eq!(expand_hyper("cmd-hyper-f"), "cmd+shift+control+alt+super+f");
     }
 }

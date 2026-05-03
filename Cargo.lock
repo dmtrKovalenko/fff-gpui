@@ -1687,6 +1687,7 @@ dependencies = [
  "json5",
  "mimalloc",
  "objc",
+ "rust-embed",
  "serde",
  "serde_json",
  "smol",

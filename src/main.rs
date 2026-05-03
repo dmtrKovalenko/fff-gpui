@@ -1,5 +1,6 @@
 #![allow(unexpected_cfgs)]
 
+mod assets;
 mod config;
 mod editor;
 mod hotkey;
@@ -16,6 +17,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use assets::{Assets, FontAssets};
 use global_hotkey::GlobalHotKeyManager;
 use gpui::prelude::*;
 use gpui::*;
@@ -586,10 +588,9 @@ fn main() {
                     Ok(mut child) => {
                         let _ = child.wait();
                     }
-                    Err(err) => eprintln!(
-                        "fff-gpui: failed to open {}: {err}",
-                        entry.path.display()
-                    ),
+                    Err(err) => {
+                        eprintln!("fff-gpui: failed to open {}: {err}", entry.path.display())
+                    }
                 }
             }
             return;
@@ -600,12 +601,13 @@ fn main() {
     start_listener(service_tx.clone()).expect("failed to start launch request listener");
     info!("resident service listener started");
 
-    let app = Application::new();
+    let app = Application::new().with_assets(Assets);
     let reopen_session = picker_session.clone();
     let reopen_runtime_config = runtime_config.clone();
     app.on_reopen(move |cx| show_or_focus_picker(&reopen_session, &reopen_runtime_config, cx));
 
     app.run(move |cx: &mut App| {
+        FontAssets::load_fonts(cx).expect("failed to load bundled fonts");
         make_dockless();
         hotkey::install_event_handler(service_tx.clone());
         if let Ok(state) = runtime_config.lock() {

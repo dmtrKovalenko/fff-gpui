@@ -203,11 +203,7 @@ fn append_span(
     });
 }
 
-fn push_text(
-    lines: &mut Vec<HighlightedLine>,
-    mut text: &str,
-    style: theme::SyntaxRenderStyle,
-) {
+fn push_text(lines: &mut Vec<HighlightedLine>, mut text: &str, style: theme::SyntaxRenderStyle) {
     while !text.is_empty() {
         let newline = text.find('\n');
         match newline {
@@ -266,10 +262,7 @@ fn highlighted_lines(content: &str, spec: &TreeSitterLanguageSpec) -> Option<Vec
                 push_text(&mut lines, &content[start..end], style);
             }
             HighlightEvent::HighlightStart(highlight) => {
-                let capture_name = capture_names
-                    .get(highlight.0)
-                    .copied()
-                    .unwrap_or("text");
+                let capture_name = capture_names.get(highlight.0).copied().unwrap_or("text");
                 style_stack.push(theme::syntax_render_style(capture_name));
             }
             HighlightEvent::HighlightEnd => {
@@ -313,7 +306,10 @@ fn plain_text_lines(content: &str) -> Vec<HighlightedLine> {
     lines
 }
 
-fn slice_preview_lines(lines: Vec<HighlightedLine>, start_line: usize) -> (usize, Vec<HighlightedLine>) {
+fn slice_preview_lines(
+    lines: Vec<HighlightedLine>,
+    start_line: usize,
+) -> (usize, Vec<HighlightedLine>) {
     let start = start_line.saturating_sub(1);
     let preview = lines
         .into_iter()
@@ -373,8 +369,7 @@ pub fn overlay_match_ranges(
 
             let pre_s = (chunk_start - span_start) as usize;
             let pre_e = (overlap_start - span_start) as usize;
-            if let Some((pre_s, pre_e)) = clamp_range_to_char_boundaries(&span.text, pre_s, pre_e)
-            {
+            if let Some((pre_s, pre_e)) = clamp_range_to_char_boundaries(&span.text, pre_s, pre_e) {
                 result.push(HighlightedSpan {
                     color: span.color,
                     bg: span.bg,
@@ -462,13 +457,16 @@ mod tests {
 
     #[test]
     fn tree_sitter_capture_name_aliases_resolve_to_zed_tokens() {
-        assert_eq!(theme::syntax_color("comment.documentation"), theme::syntax_color("comment"));
+        assert_eq!(
+            theme::syntax_color("comment.documentation"),
+            theme::syntax_color("comment")
+        );
     }
 
     #[test]
     fn tree_sitter_highlight_map_detects_typescript_files() {
-        let spec = syntax_set_for_path(Path::new("component.ts"))
-            .expect("typescript should be supported");
+        let spec =
+            syntax_set_for_path(Path::new("component.ts")).expect("typescript should be supported");
 
         assert_eq!(spec.name, "typescript");
     }
