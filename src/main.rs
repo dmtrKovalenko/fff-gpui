@@ -43,10 +43,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[derive(Debug, Clone)]
 struct LaunchOptions {
     base_path: PathBuf,
-    background: bool,
     open_path: Option<PathBuf>,
     base_path_explicit: bool,
     start_in_grep: bool,
+    show_help: bool,
+    show_version: bool,
 }
 
 type ResponderArc = Arc<Mutex<Option<service::ClientStream>>>;
@@ -94,15 +95,21 @@ fn normalize_dir(path: PathBuf) -> Option<PathBuf> {
 
 // Resolve the base directory from argv[1] or the user's home directory.
 fn parse_launch_options() -> LaunchOptions {
-    let mut background = false;
     let mut base_path = None;
     let mut open_path = None;
     let mut start_in_grep = false;
+    let mut show_help = false;
+    let mut show_version = false;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
-        if arg == "-d" || arg == "--daemon" {
-            background = true;
+        if arg == "-h" || arg == "--help" {
+            show_help = true;
+            continue;
+        }
+
+        if arg == "-V" || arg == "--version" {
+            show_version = true;
             continue;
         }
 
@@ -127,11 +134,21 @@ fn parse_launch_options() -> LaunchOptions {
 
     LaunchOptions {
         base_path: base_path.clone().unwrap_or_else(home_dir),
-        background,
         open_path,
         base_path_explicit: base_path.is_some(),
         start_in_grep,
+        show_help,
+        show_version,
     }
+}
+
+fn print_help() {
+    println!(
+        "fff-gpui {version}\n\n\
+Usage:\n  fff-gpui [OPTIONS] [PATH]\n\n\
+Options:\n  --grep            Start in grep mode\n  --open <PATH>     Open a specific path\n  -h, --help        Show this help text\n  -V, --version     Show version information",
+        version = env!("CARGO_PKG_VERSION")
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -490,6 +507,14 @@ fn main() {
     log::init_tracing();
 
     let launch = parse_launch_options();
+    if launch.show_help {
+        print_help();
+        return;
+    }
+    if launch.show_version {
+        println!("fff-gpui {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let base_path = launch.base_path.clone();
     let picker_session = Arc::new(Mutex::new(PickerSession::new(
         base_path.clone(),
@@ -522,7 +547,6 @@ fn main() {
 
     info!(
         base_path = %base_path.display(),
-        background = launch.background,
         config_path = %loaded_config.path.display(),
         global_keybind = ?loaded_config.config.global_keybind,
         "starting fff-gpui"
