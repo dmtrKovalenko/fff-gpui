@@ -26,7 +26,8 @@ const DEFAULT_MATCH_HIGHLIGHT: u32 = 0x4A9EFF;
 const DEFAULT_PREVIEW_BG: u32 = 0x161618;
 const DEFAULT_UI_FONT_FAMILY: &str = ".ZedSans";
 const DEFAULT_BUFFER_FONT_FAMILY: &str = ".ZedMono";
-pub const DEFAULT_FONT_SIZE: f32 = 14.0;
+pub const DEFAULT_UI_FONT_SIZE: f32 = 16.0;
+pub const DEFAULT_BUFFER_FONT_SIZE: f32 = 15.0;
 
 static ACTIVE_THEME: OnceLock<RwLock<AppTheme>> = OnceLock::new();
 static THEME_VERSION: AtomicU64 = AtomicU64::new(1);
@@ -48,9 +49,6 @@ pub struct Palette {
     pub input_text: u32,
     pub cursor: u32,
     pub cursor_selection: u32,
-    pub font_family: Option<String>,
-    pub buffer_font_family: Option<String>,
-    pub font_size: f32,
     pub picker_pane_width: f32,
 }
 
@@ -71,9 +69,10 @@ pub struct AppTheme {
     pub input_text: u32,
     pub cursor: u32,
     pub cursor_selection: u32,
-    pub font_family: Option<String>,
+    pub ui_font_family: Option<String>,
     pub buffer_font_family: Option<String>,
-    pub font_size: f32,
+    pub ui_font_size: f32,
+    pub buffer_font_size: f32,
     pub picker_pane_width: f32,
     pub syntax_styles: Vec<(String, SyntaxStyle)>,
     pub syntax_default_color: u32,
@@ -106,9 +105,6 @@ impl Default for Palette {
             input_text: 0xE5E5EA,
             cursor: 0x0A84FF,
             cursor_selection: 0x0A84FF44,
-            font_family: None,
-            buffer_font_family: None,
-            font_size: DEFAULT_FONT_SIZE,
             picker_pane_width: DEFAULT_PICKER_PANE_WIDTH,
         }
     }
@@ -132,9 +128,10 @@ impl Default for AppTheme {
             input_text: 0xE5E5EA,
             cursor: 0x0A84FF,
             cursor_selection: 0x0A84FF44,
-            font_family: None,
-            buffer_font_family: None,
-            font_size: DEFAULT_FONT_SIZE,
+            ui_font_family: Some(DEFAULT_UI_FONT_FAMILY.to_string()),
+            buffer_font_family: Some(DEFAULT_BUFFER_FONT_FAMILY.to_string()),
+            ui_font_size: DEFAULT_UI_FONT_SIZE,
+            buffer_font_size: DEFAULT_BUFFER_FONT_SIZE,
             picker_pane_width: DEFAULT_PICKER_PANE_WIDTH,
             syntax_styles: Vec::new(),
             syntax_default_color: DEFAULT_TEXT_PRIMARY,
@@ -216,6 +213,10 @@ struct ZedSettings {
     ui_font_family: Option<String>,
     #[serde(default)]
     buffer_font_family: Option<String>,
+    #[serde(default)]
+    ui_font_size: Option<f32>,
+    #[serde(default)]
+    buffer_font_size: Option<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -236,6 +237,21 @@ struct ExtensionManifest {
     #[serde(default)]
     themes: Vec<PathBuf>,
 }
+
+const BUILTIN_THEME_FAMILIES: &[(&str, &str)] = &[
+    (
+        "vendor/zed/themes/ayu/ayu.json",
+        include_str!("../vendor/zed/themes/ayu/ayu.json"),
+    ),
+    (
+        "vendor/zed/themes/gruvbox/gruvbox.json",
+        include_str!("../vendor/zed/themes/gruvbox/gruvbox.json"),
+    ),
+    (
+        "vendor/zed/themes/one/one.json",
+        include_str!("../vendor/zed/themes/one/one.json"),
+    ),
+];
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 pub struct SyntaxStyle {
@@ -289,9 +305,6 @@ pub fn palette() -> Palette {
         input_text: theme.input_text,
         cursor: theme.cursor,
         cursor_selection: theme.cursor_selection,
-        font_family: theme.font_family.clone(),
-        buffer_font_family: theme.buffer_font_family.clone(),
-        font_size: theme.font_size,
         picker_pane_width: theme.picker_pane_width,
     }
 }
@@ -318,31 +331,59 @@ pub fn version() -> u64 {
 }
 
 pub fn sync_from_config(config: &AppConfig, appearance: WindowAppearance, cx: &mut App) {
-    let mut resolved = if config.sync_zed_settings {
-        match resolve_from_zed_settings(appearance) {
-            Ok(theme) => theme,
+    let need_theme_catalog = config.sync_zed_settings || config.theme.name.is_some();
+    let theme_catalog = if need_theme_catalog {
+        match load_theme_catalog() {
+            Ok(catalog) => Some(catalog),
             Err(err) => {
-                warn!(error = %err, "failed to sync Zed theme settings; falling back to defaults");
-                AppTheme::default()
+                warn!(error = %err, "failed to load theme catalog; falling back to defaults");
+                None
             }
+        }
+    } else {
+        None
+    };
+
+    let mut resolved = if config.sync_zed_settings {
+        match theme_catalog.as_ref() {
+            Some(catalog) => match resolve_from_zed_settings(appearance, catalog) {
+                Ok(theme) => theme,
+                Err(err) => {
+                    warn!(error = %err, "failed to sync Zed theme settings; falling back to defaults");
+                    AppTheme::default()
+                }
+            },
+            None => AppTheme::default(),
         }
     } else {
         AppTheme::default()
     };
 
-    if let Some(family) = config.font.family.as_deref() {
-        let trimmed = family.trim();
-        if !trimmed.is_empty() {
-            let family = trimmed.to_string();
-            resolved.font_family = Some(family.clone());
-            resolved.buffer_font_family = Some(family);
+    if let Some(catalog) = theme_catalog.as_ref()
+        && let Some(name) = config.theme.name.as_deref()
+    {
+        if !name.trim().is_empty() {
+            apply_named_theme(name, catalog, &mut resolved);
         }
     }
-    if let Some(size) = config.font.size
-        && size.is_finite()
-        && size > 0.0
-    {
-        resolved.font_size = size;
+
+    if let Some(family) = resolve_optional_string(
+        config.font.ui_family.as_deref(),
+        config.font.family.as_deref(),
+    ) {
+        resolved.ui_font_family = Some(family);
+    }
+    if let Some(family) = resolve_optional_string(
+        config.font.buffer_family.as_deref(),
+        config.font.family.as_deref(),
+    ) {
+        resolved.buffer_font_family = Some(family);
+    }
+    if let Some(size) = resolve_optional_font_size(config.font.ui_size, config.font.size) {
+        resolved.ui_font_size = size;
+    }
+    if let Some(size) = resolve_optional_font_size(config.font.buffer_size, config.font.size) {
+        resolved.buffer_font_size = size;
     }
     if config.picker_pane_width.is_finite() && config.picker_pane_width > 0.0 {
         resolved.picker_pane_width = config.picker_pane_width;
@@ -422,24 +463,22 @@ fn read_to_string(path: &Path) -> Result<String> {
     fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let contents = read_to_string(path)?;
-    json5::from_str(&contents)
-        .with_context(|| format!("failed to parse JSON from {}", path.display()))
-}
-
 fn load_zed_settings() -> Result<ZedSettings> {
     let path = zed_settings_path();
     if !path.exists() {
         return Ok(ZedSettings::default());
     }
 
-    read_json(&path)
+    let contents = read_to_string(&path)?;
+    json5::from_str(&contents)
+        .with_context(|| format!("failed to parse JSON from {}", path.display()))
 }
 
-fn resolve_from_zed_settings(appearance: WindowAppearance) -> Result<AppTheme> {
+fn resolve_from_zed_settings(
+    appearance: WindowAppearance,
+    catalog: &HashMap<String, ThemeCatalogEntry>,
+) -> Result<AppTheme> {
     let settings = load_zed_settings()?;
-    let catalog = load_theme_catalog()?;
     let ui_font_family = SharedString::from(
         settings
             .ui_font_family
@@ -455,50 +494,26 @@ fn resolve_from_zed_settings(appearance: WindowAppearance) -> Result<AppTheme> {
         .as_ref()
         .map(|theme| resolve_theme_name(theme, appearance));
 
-    Ok(match resolved_name {
-        Some(name) => match catalog.get(&normalize_name(&name)).cloned() {
-            Some(entry) => AppTheme {
-                bg: entry.palette.bg,
-                border: entry.palette.border,
-                selected_row: entry.palette.selected_row,
-                hover_row: entry.palette.hover_row,
-                text_primary: entry.palette.text_primary,
-                text_secondary: entry.palette.text_secondary,
-                text_dim: entry.palette.text_dim,
-                status_bar_bg: entry.palette.status_bar_bg,
-                match_highlight: entry.palette.match_highlight,
-                match_highlight_bg: entry.palette.match_highlight_bg,
-                preview_bg: entry.palette.preview_bg,
-                input_bg: 0x232326,
-                input_text: 0xE5E5EA,
-                cursor: 0x0A84FF,
-                cursor_selection: 0x0A84FF44,
-                font_family: Some(ui_font_family.to_string()),
-                buffer_font_family: Some(buffer_font_family.to_string()),
-                font_size: DEFAULT_FONT_SIZE,
-                picker_pane_width: DEFAULT_PICKER_PANE_WIDTH,
-                syntax_default_color: entry.syntax_default_color,
-                syntax_styles: entry.syntax_styles,
-            },
-            None => {
-                warn!(theme = %name, "Zed theme not found; using built-in fallback theme");
-                let mut theme = AppTheme::default();
-                theme.font_family = Some(ui_font_family.to_string());
-                theme.buffer_font_family = Some(buffer_font_family.to_string());
-                theme
-            }
-        },
-        None => {
-            debug!(
-                settings_path = %zed_settings_path().display(),
-                "no Zed theme configured; using built-in fallback theme"
-            );
-            let mut theme = AppTheme::default();
-            theme.font_family = Some(ui_font_family.to_string());
-            theme.buffer_font_family = Some(buffer_font_family.to_string());
-            theme
+    let mut theme = AppTheme::default();
+    if let Some(name) = resolved_name {
+        if let Some(entry) = catalog.get(&normalize_name(&name)) {
+            apply_catalog_entry(entry, &mut theme);
+        } else {
+            warn!(theme = %name, "Zed theme not found; using built-in fallback theme");
         }
-    })
+    } else {
+        debug!(
+            settings_path = %zed_settings_path().display(),
+            "no Zed theme configured; using built-in fallback theme"
+        );
+    }
+
+    theme.ui_font_family = Some(ui_font_family.to_string());
+    theme.buffer_font_family = Some(buffer_font_family.to_string());
+    theme.ui_font_size = settings.ui_font_size.unwrap_or(DEFAULT_UI_FONT_SIZE);
+    theme.buffer_font_size = settings.buffer_font_size.unwrap_or(DEFAULT_BUFFER_FONT_SIZE);
+
+    Ok(theme)
 }
 
 fn resolve_theme_name(selection: &ThemeSelection, appearance: WindowAppearance) -> String {
@@ -517,9 +532,18 @@ fn resolve_theme_name(selection: &ThemeSelection, appearance: WindowAppearance) 
 
 fn load_theme_catalog() -> Result<HashMap<String, ThemeCatalogEntry>> {
     let mut catalog = HashMap::new();
+    load_builtin_theme_catalog(&mut catalog)?;
     load_installed_theme_catalog(&mut catalog)?;
     load_local_theme_catalog(&mut catalog)?;
     Ok(catalog)
+}
+
+fn load_builtin_theme_catalog(catalog: &mut HashMap<String, ThemeCatalogEntry>) -> Result<()> {
+    for &(label, contents) in BUILTIN_THEME_FAMILIES {
+        load_theme_family_contents(label, contents, catalog)?;
+    }
+
+    Ok(())
 }
 
 fn load_local_theme_catalog(catalog: &mut HashMap<String, ThemeCatalogEntry>) -> Result<()> {
@@ -591,7 +615,17 @@ fn load_theme_family_file(
     path: &Path,
     catalog: &mut HashMap<String, ThemeCatalogEntry>,
 ) -> Result<()> {
-    let family: ThemeFamilyFile = read_json(path)?;
+    let contents = read_to_string(path)?;
+    load_theme_family_contents(&path.display().to_string(), &contents, catalog)
+}
+
+fn load_theme_family_contents(
+    label: &str,
+    contents: &str,
+    catalog: &mut HashMap<String, ThemeCatalogEntry>,
+) -> Result<()> {
+    let family: ThemeFamilyFile = json5::from_str(contents)
+        .with_context(|| format!("failed to parse JSON from {label}"))?;
 
     for variant in family.themes {
         let theme_key = normalize_name(&variant.name);
@@ -607,6 +641,54 @@ fn load_theme_family_file(
     }
 
     Ok(())
+}
+
+fn apply_named_theme(name: &str, catalog: &HashMap<String, ThemeCatalogEntry>, theme: &mut AppTheme) {
+    if let Some(entry) = catalog.get(&normalize_name(name)) {
+        apply_catalog_entry(entry, theme);
+    } else {
+        warn!(theme = %name, "theme override not found in catalog");
+    }
+}
+
+fn apply_catalog_entry(entry: &ThemeCatalogEntry, theme: &mut AppTheme) {
+    theme.bg = entry.palette.bg;
+    theme.border = entry.palette.border;
+    theme.selected_row = entry.palette.selected_row;
+    theme.hover_row = entry.palette.hover_row;
+    theme.text_primary = entry.palette.text_primary;
+    theme.text_secondary = entry.palette.text_secondary;
+    theme.text_dim = entry.palette.text_dim;
+    theme.status_bar_bg = entry.palette.status_bar_bg;
+    theme.match_highlight = entry.palette.match_highlight;
+    theme.match_highlight_bg = entry.palette.match_highlight_bg;
+    theme.preview_bg = entry.palette.preview_bg;
+    theme.input_bg = entry.palette.input_bg;
+    theme.input_text = entry.palette.input_text;
+    theme.cursor = entry.palette.cursor;
+    theme.cursor_selection = entry.palette.cursor_selection;
+    theme.syntax_styles = entry.syntax_styles.clone();
+    theme.syntax_default_color = entry.syntax_default_color;
+}
+
+fn resolve_optional_string(primary: Option<&str>, fallback: Option<&str>) -> Option<String> {
+    primary
+        .and_then(|value| {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        })
+        .or_else(|| {
+            fallback.and_then(|value| {
+                let value = value.trim();
+                (!value.is_empty()).then(|| value.to_owned())
+            })
+        })
+}
+
+fn resolve_optional_font_size(primary: Option<f32>, fallback: Option<f32>) -> Option<f32> {
+    primary
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .or_else(|| fallback.filter(|value| value.is_finite() && *value > 0.0))
 }
 
 fn palette_from_style(style: &Value) -> Palette {
@@ -649,9 +731,6 @@ fn palette_from_style(style: &Value) -> Palette {
         cursor: color_from_style(style, "editor.cursor").unwrap_or(0x0A84FF),
         cursor_selection: color_from_style(style, "editor.selectionBackground")
             .unwrap_or(0x0A84FF44),
-        font_family: None,
-        buffer_font_family: None,
-        font_size: DEFAULT_FONT_SIZE,
         picker_pane_width: DEFAULT_PICKER_PANE_WIDTH,
     }
 }
@@ -880,5 +959,14 @@ mod tests {
         assert_eq!(theme.syntax_color("type"), 0x112233);
         assert_eq!(theme.syntax_color("punctuation"), 0xddeeff);
         assert_eq!(theme.syntax_color("punctuation.bracket"), 0xddeeff);
+    }
+
+    #[test]
+    fn builtin_theme_catalog_includes_zed_themes() {
+        let catalog = load_theme_catalog().expect("theme catalog should load");
+
+        assert!(catalog.contains_key("ayu dark"));
+        assert!(catalog.contains_key("gruvbox dark"));
+        assert!(catalog.contains_key("one dark"));
     }
 }

@@ -9,6 +9,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::theme::AppTheme;
 use crate::theme;
 
 actions!(
@@ -603,6 +604,7 @@ impl Element for TextFieldElement {
 impl Render for TextField {
     // Render the text field shell.
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.global::<AppTheme>().clone();
         div()
             .key_context("FffTextField")
             .track_focus(&self.focus_handle(cx))
@@ -632,8 +634,8 @@ impl Render for TextField {
             .border_1()
             .border_color(rgb(theme::palette().border))
             .rounded(px(6.0))
-            .line_height(px(18.0))
-            .text_size(px(14.0))
+            .line_height(px(theme.buffer_font_size * 1.2))
+            .text_size(px(theme.buffer_font_size))
             .child(TextFieldElement { input: cx.entity() })
     }
 }

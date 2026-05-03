@@ -21,16 +21,30 @@ fn default_picker_pane_width() -> f32 {
     DEFAULT_PICKER_PANE_WIDTH
 }
 
+fn default_sync_zed_settings() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FontConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_size: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_size: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThemeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,9 +80,7 @@ pub struct ThemeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
-    #[serde(alias = "launch_on_startup")]
-    pub launch_at_login: bool,
-    #[serde(rename = "sync-zed-settings")]
+    #[serde(default = "default_sync_zed_settings", alias = "sync-zed-settings")]
     pub sync_zed_settings: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub global_keybind: Option<String>,
@@ -87,7 +99,6 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            launch_at_login: true,
             sync_zed_settings: true,
             global_keybind: None,
             window_width: DEFAULT_WINDOW_WIDTH,

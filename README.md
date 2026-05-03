@@ -13,7 +13,6 @@ Under the hood it uses [fff](https://crates.io/crates/fff-search) for fuzzy file
 - Syntax-highlighted file preview
 - Global keybind support for system-wide access
 - Deep Zed integration via custom tasks — works across all projects
-- Launch at login support
 
 ## Zed integration
 
@@ -105,11 +104,25 @@ Set a keybind in `~/.config/fff-gpui/config.toml`:
 ```toml
 sync_zed_settings = true
 global_keybind = "cmd+shift+f"
+window_width = 960.0
+window_height = 520.0
+picker_pane_width = 430.0
+
+[font]
+ui_family = ".ZedSans"
+buffer_family = ".ZedMono"
+ui_size = 16.0
+buffer_size = 15.0
+
+[theme]
+name = "One Dark"
 ```
 
-When `sync_zed_settings` is enabled, fff-gpui reads Zed's `settings.json` and mirrors the UI font, buffer font, light/dark theme selection, and theme colors from any installed Zed theme.
+When `sync_zed_settings` is enabled, fff-gpui reads Zed's `settings.json` and mirrors the UI font, buffer font, UI and buffer font sizes, light/dark theme selection, and theme colors from the bundled Zed themes plus any installed or local Zed theme.
 
-Zed themes are discovered from your local Zed installation, including extension themes under `~/Library/Application Support/Zed/extensions/installed/` on macOS.
+Explicit config values still win, so you can keep Zed sync enabled and override just the theme, fonts, sizes, or specific colors in `config.toml` when needed. In practice that means `[theme].name` overrides Zed's chosen theme, and `[font]` overrides the synced font families and sizes.
+
+Zed themes are discovered from the bundled Zed theme set, your local Zed installation, and extension themes under `~/Library/Application Support/Zed/extensions/installed/` on macOS.
 
 Then launch the app once:
 

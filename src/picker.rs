@@ -1337,12 +1337,13 @@ impl Render for FffPicker {
             }
         }
         let theme = cx.global::<AppTheme>().clone();
-        let font_family = theme.font_family.clone();
+        let ui_font_family = theme.ui_font_family.clone();
         let buffer_font_family = theme
             .buffer_font_family
-            .clone()
-            .or_else(|| theme.font_family.clone());
-        let preview_line_height = px(14.0);
+            .clone();
+        let ui_font_size = px(theme.ui_font_size);
+        let buffer_font_size = px(theme.buffer_font_size);
+        let preview_line_height = px(theme.buffer_font_size);
         let results = self.results.clone();
         let preview_lines = self.preview_lines.clone();
         let selected = self.selected;
@@ -1426,7 +1427,8 @@ impl Render for FffPicker {
             .flex_col()
             .bg(rgb(theme.bg))
             .text_color(rgb(theme.text_primary))
-            .when_some(font_family.clone(), |this, family| this.font_family(family))
+            .text_size(ui_font_size)
+            .when_some(ui_font_family.clone(), |this, family| this.font_family(family))
             .child(
                 div()
                     .flex_1()
@@ -1551,7 +1553,7 @@ impl Render for FffPicker {
                                                     theme.text_secondary
                                                 };
                                                 // Monospace approximation: a char is roughly 0.6 of the em.
-                                                let char_px = theme.font_size * 0.6;
+                                                let char_px = theme.ui_font_size * 0.6;
                                                 let overhead_px = 101.0;
                                                 let filename_chars =
                                                     item.file_name.chars().count() as f32;
@@ -1768,6 +1770,10 @@ impl Render for FffPicker {
                     .gap(px(8.0))
                     .border_t_1()
                     .border_color(rgb(theme.border))
+                    .text_size(buffer_font_size)
+                    .when_some(buffer_font_family.clone(), |this, family| {
+                        this.font_family(family)
+                    })
                     .child(
                         div()
                             .text_color(rgb(theme.match_highlight))
@@ -1779,9 +1785,6 @@ impl Render for FffPicker {
                             .flex_1()
                             .w_full()
                             .min_w(px(0.0))
-                            .when_some(buffer_font_family.clone(), |this, family| {
-                                this.font_family(family)
-                            })
                             .child(self.text_field.clone()),
                     ),
                     )
@@ -1800,6 +1803,10 @@ impl Render for FffPicker {
                             .flex()
                             .flex_col()
                             .bg(rgb(theme.preview_bg))
+                            .text_size(buffer_font_size)
+                            .when_some(buffer_font_family.clone(), |this, family| {
+                                this.font_family(family)
+                            })
                             .overflow_hidden()
                             .when_some(preview_header_path, |this, path| {
                                 this.child(
@@ -1828,7 +1835,7 @@ impl Render for FffPicker {
                                 .child(preview_placeholder),
                         )
                     })
-                    .when(!preview_lines.is_empty(), |this| {
+                            .when(!preview_lines.is_empty(), |this| {
                         this.child(
                             uniform_list("preview", preview_lines.len(), move |range, _window, _cx| {
                                 range
@@ -1840,13 +1847,10 @@ impl Render for FffPicker {
                                         .px(px(8.0))
                                         .flex()
                                         .items_center()
-                                        .when_some(buffer_font_family.clone(), |this, family| {
-                                            this.font_family(family)
-                                        })
                                         .children(line.spans.iter().map(|span| {
                                                 let mut element = div()
                                                     .text_xs()
-                                                    .line_height(px(14.0))
+                                                    .line_height(preview_line_height)
                                                     .text_color(rgb(span.color))
                                                     .when(span.bold, |d| d.font_weight(FontWeight::BOLD))
                                                     .when(span.italic, |d| d.italic())
