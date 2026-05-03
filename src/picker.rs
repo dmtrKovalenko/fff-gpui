@@ -25,7 +25,7 @@ use crate::path_shortening::PathShortenStrategy;
 use crate::preview::{self, HighlightedLine};
 use crate::service::{ClientStream, PickEntry, PickResponse};
 use crate::text_field::TextField;
-use crate::theme::{self, AppTheme};
+use crate::theme::{self, AppTheme, FileIconPath};
 
 pub type ResponderArc = Arc<Mutex<Option<ClientStream>>>;
 
@@ -289,6 +289,25 @@ fn git_status_bar_color(status: Option<&str>) -> Option<u32> {
         Some("ignored") => Some(0x6C6C70),
         Some("clean") | None => None,
         Some(_) => Some(0x6C6C70),
+    }
+}
+
+fn render_file_icon(icon: Option<FileIconPath>, muted: u32) -> AnyElement {
+    match icon {
+        Some(FileIconPath::Embedded(path)) => svg()
+            .path(path)
+            .size(px(16.0))
+            .flex_shrink_0()
+            .text_color(rgb(muted))
+            .into_any_element(),
+        Some(FileIconPath::External(path)) => {
+            img(path).size(px(16.0)).flex_shrink_0().into_any_element()
+        }
+        None => div()
+            .w(px(16.0))
+            .h(px(16.0))
+            .flex_shrink_0()
+            .into_any_element(),
     }
 }
 
@@ -1151,7 +1170,10 @@ impl FffPicker {
     // Translate a result index to a visual list index. The list renders bottom-up,
     // so rank 0 (best match) sits at the bottom, just above the input.
     fn visual_index(&self, data_index: usize) -> usize {
-        self.results.len().saturating_sub(1).saturating_sub(data_index)
+        self.results
+            .len()
+            .saturating_sub(1)
+            .saturating_sub(data_index)
     }
 
     // Select the clicked row and refresh the preview.
@@ -1338,9 +1360,7 @@ impl Render for FffPicker {
         }
         let theme = cx.global::<AppTheme>().clone();
         let ui_font_family = theme.ui_font_family.clone();
-        let buffer_font_family = theme
-            .buffer_font_family
-            .clone();
+        let buffer_font_family = theme.buffer_font_family.clone();
         let ui_font_size = px(theme.ui_font_size);
         let buffer_font_size = px(theme.buffer_font_size);
         let preview_line_height = px(theme.buffer_font_size);
@@ -1567,6 +1587,8 @@ impl Render for FffPicker {
                                                     shorten_dir_for_row(&item.dir, path_max_chars);
                                                 let bar_color =
                                                     git_status_bar_color(item.git_status.as_deref());
+                                                let file_icon =
+                                                    theme::file_icon_for_path(&item.absolute_path);
 
                                                 let content_match: Option<(String, Vec<Range<usize>>)> =
                                                     if item.match_ranges.is_empty() {
@@ -1637,6 +1659,10 @@ impl Render for FffPicker {
                                                                     .items_center()
                                                                     .gap(px(8.0))
                                                                     .text_sm()
+                                                                    .child(render_file_icon(
+                                                                        file_icon.clone(),
+                                                                        theme.icon_muted,
+                                                                    ))
                                                                     .when(content_match.is_some(), |d| {
                                                                         let (text, ranges) =
                                                                             content_match.as_ref().unwrap();
