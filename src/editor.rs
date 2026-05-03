@@ -4,17 +4,42 @@ use std::process::{Child, Command};
 use anyhow::{Context as _, anyhow};
 use tracing::{debug, info, instrument};
 
-// Spawn the user's $EDITOR or $VISUAL with the selected file.
-#[instrument(skip(path), fields(path = %path.display(), goto = ?goto))]
-pub fn open_in_editor(path: &Path, goto: Option<(usize, usize)>) -> anyhow::Result<Child> {
-    let editor = std::env::var("EDITOR")
-        .or_else(|_| std::env::var("VISUAL"))
-        .map_err(|_| {
-            anyhow!(
-                "Neither $EDITOR nor $VISUAL is set; refusing to guess an editor for {}",
-                path.display()
-            )
-        })?;
+fn env_editor(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| (!value.trim().is_empty()).then_some(value))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorSource {
+    EnvEditor,
+    EnvVisual,
+    Config,
+}
+
+pub fn resolve_editor(config_editor: &str) -> Option<(EditorSource, String)> {
+    env_editor("EDITOR")
+        .map(|editor| (EditorSource::EnvEditor, editor))
+        .or_else(|| env_editor("VISUAL").map(|editor| (EditorSource::EnvVisual, editor)))
+        .or_else(|| {
+            let editor = config_editor.trim();
+            (!editor.is_empty()).then(|| (EditorSource::Config, editor.to_owned()))
+        })
+}
+
+// Spawn the user's $EDITOR or $VISUAL, falling back to config.editor when needed.
+#[instrument(skip(path, config_editor), fields(path = %path.display(), goto = ?goto))]
+pub fn open_in_editor(
+    path: &Path,
+    goto: Option<(usize, usize)>,
+    config_editor: &str,
+) -> anyhow::Result<Child> {
+    let editor = resolve_editor(config_editor).map(|(_, editor)| editor).ok_or_else(|| {
+        anyhow!(
+            "Neither $EDITOR nor $VISUAL nor config editor is set; refusing to guess an editor for {}",
+            path.display()
+        )
+    })?;
 
     info!(editor = ?editor, "opening file with editor");
 

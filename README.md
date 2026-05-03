@@ -29,6 +29,7 @@ brew services start fff-gpui
 Set options in `~/.config/fff-gpui/config.toml`:
 
 ```toml
+editor = "zed"
 sync_zed_settings = true
 global_keybind = "hyper+f"
 window_width = 960.0
@@ -44,6 +45,8 @@ buffer_size = 15.0
 [theme]
 name = "One Dark"
 ```
+
+`editor` is a fallback for the resident Homebrew service, which does not inherit your shell environment. If `EDITOR` or `VISUAL` is present in the current process, those still win, so custom tasks and other integrations can keep overriding it naturally.
 
 When `sync_zed_settings` is enabled, fff-gpui reads Zed's `settings.json` and mirrors the UI font, buffer font, font sizes, light/dark theme selection, and theme colors — from the bundled Zed themes plus any installed or local Zed theme.
 

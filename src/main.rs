@@ -280,7 +280,7 @@ fn open_config_file(runtime: &Arc<Mutex<RuntimeConfig>>) {
         return;
     }
 
-    match editor::open_in_editor(&path, None) {
+    match editor::open_in_editor(&path, None, &config.editor) {
         Ok(child) => {
             info!(pid = child.id(), path = %path.display(), "opened config file");
         }
@@ -303,6 +303,7 @@ fn open_window(session: PickerSession, runtime_config: &Arc<Mutex<RuntimeConfig>
     let enable_content_indexing = session.enable_content_indexing;
     let start_in_grep = session.start_in_grep;
     let responder = session.responder;
+    let editor = config.editor.clone();
     let window_width = config.window_width;
     let window_height = config.window_height;
     let bounds = cx
@@ -336,6 +337,7 @@ fn open_window(session: PickerSession, runtime_config: &Arc<Mutex<RuntimeConfig>
                     shared.clone(),
                     enable_content_indexing,
                     start_in_grep,
+                    editor.clone(),
                     responder.clone(),
                     cx,
                 )
@@ -546,6 +548,7 @@ fn main() {
     let visual = std::env::var("VISUAL").ok();
     let path_env = std::env::var("PATH").ok();
     let cwd = std::env::current_dir().ok();
+    let editor_resolution = editor::resolve_editor(&loaded_config.config.editor);
 
     info!(
         base_path = %base_path.display(),
@@ -553,6 +556,14 @@ fn main() {
         global_keybind = ?loaded_config.config.global_keybind,
         "starting fff-gpui"
     );
+    match editor_resolution {
+        Some((source, ref value)) => {
+            info!(editor_source = ?source, editor = %value, "resolved editor");
+        }
+        None => {
+            info!(editor_source = "unset", editor = "", "resolved editor");
+        }
+    }
     debug!(
         shell = ?shell,
         home = ?home,
@@ -584,7 +595,7 @@ fn main() {
             info!(count = entries.len(), "received pick response from daemon");
             for entry in entries {
                 let goto = entry.line.zip(entry.column);
-                match editor::open_in_editor(&entry.path, goto) {
+                match editor::open_in_editor(&entry.path, goto, &loaded_config.config.editor) {
                     Ok(mut child) => {
                         let _ = child.wait();
                     }

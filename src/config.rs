@@ -84,6 +84,8 @@ pub struct ThemeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub editor: String,
     #[serde(default = "default_sync_zed_settings", alias = "sync-zed-settings")]
     pub sync_zed_settings: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -103,6 +105,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            editor: String::new(),
             sync_zed_settings: true,
             global_keybind: None,
             window_width: DEFAULT_WINDOW_WIDTH,

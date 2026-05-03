@@ -145,6 +145,7 @@ pub struct FffPicker {
     preview_lines: Vec<HighlightedLine>,
     status_message: Option<String>,
     text_field: Entity<TextField>,
+    editor: String,
     dismiss_on_blur: Option<Subscription>,
     dismiss_on_window_blur: Option<Subscription>,
     responder: Option<ResponderArc>,
@@ -395,6 +396,7 @@ impl FffPicker {
         shared: PickerSharedState,
         enable_content_indexing: bool,
         start_in_grep: bool,
+        editor: String,
         responder: Option<ResponderArc>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -446,6 +448,7 @@ impl FffPicker {
             preview_lines: Vec::new(),
             status_message: None,
             text_field,
+            editor,
             dismiss_on_blur: None,
             dismiss_on_window_blur: None,
             responder,
@@ -1096,7 +1099,7 @@ impl FffPicker {
         let mut last_error: Option<String> = None;
         for entry in &entries {
             let goto = entry.line.zip(entry.column);
-            match editor::open_in_editor(&entry.path, goto) {
+            match editor::open_in_editor(&entry.path, goto, &self.editor) {
                 Ok(child) => {
                     info!(pid = child.id(), path = %entry.path.display(), "spawned editor");
                     opened += 1;
