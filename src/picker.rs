@@ -64,7 +64,6 @@ actions!(
         SelectNext,
         SelectPrev,
         ToggleSelected,
-        ToggleSelectedAndAdvance,
         ToggleSelectAll,
         ShiftTab,
         CycleGrepMode,
@@ -1211,19 +1210,6 @@ impl FffPicker {
         cx.notify();
     }
 
-    // Toggle the selected state for the current row, then advance the cursor up
-    // (toward the next worse-ranked result). The list is bottom-up, so "next" in
-    // the user's mental model maps to SelectPrev internally.
-    fn on_toggle_and_advance(
-        &mut self,
-        _: &ToggleSelectedAndAdvance,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.on_toggle_selected(&ToggleSelected, window, cx);
-        self.on_select_prev(&SelectPrev, window, cx);
-    }
-
     // Toggle selection across all visible results: clear if anything is marked,
     // otherwise mark every result.
     fn on_toggle_select_all(
@@ -1414,6 +1400,10 @@ impl Render for FffPicker {
                 results.len()
             )
         };
+        let mode_hint = match self.view {
+            SearchView::Files => "cmd-g grep",
+            SearchView::Grep => "cmd-f files",
+        };
         if self.view == SearchView::Grep {
             let mode = match self.grep_mode {
                 GrepMode::PlainText => "plain",
@@ -1423,7 +1413,7 @@ impl Render for FffPicker {
             if !status_text.is_empty() {
                 status_text.push_str("  \u{2022}  ");
             }
-            status_text.push_str(&format!("mode: {mode}"));
+            status_text.push_str(&format!("mode: {mode}  \u{21E7}tab mode"));
         }
 
         div()
@@ -1433,7 +1423,6 @@ impl Render for FffPicker {
             .on_action(cx.listener(Self::on_select_next))
             .on_action(cx.listener(Self::on_select_prev))
             .on_action(cx.listener(Self::on_toggle_selected))
-            .on_action(cx.listener(Self::on_toggle_and_advance))
             .on_action(cx.listener(Self::on_toggle_select_all))
             .on_action(cx.listener(Self::on_shift_tab))
             .on_action(cx.listener(Self::on_cycle_grep_mode))
@@ -1919,12 +1908,12 @@ impl Render for FffPicker {
                             .text_xs()
                             .text_color(rgb(theme.text_dim))
                             .child(match self.view {
-                                SearchView::Grep => {
-                                    "\u{2191}\u{2193} nav  tab toggle  \u{21E7}tab mode  \u{23CE} open  esc quit"
-                                }
-                                SearchView::Files => {
-                                    "\u{2191}\u{2193} nav  tab toggle  \u{23CE} open  esc quit"
-                                }
+                                SearchView::Grep => format!(
+                                    "\u{2191}\u{2193} nav  tab toggle  {mode_hint}  \u{23CE} open  esc quit"
+                                ),
+                                SearchView::Files => format!(
+                                    "\u{2191}\u{2193} nav  tab toggle  {mode_hint}  \u{23CE} open  esc quit"
+                                ),
                             }),
                     ),
             )

@@ -27,7 +27,7 @@ use config::AppConfig;
 use picker::{
     CyclePreviousQuery, FffPicker, OpenSelected, PickerSharedState, PreviewScrollDown,
     PreviewScrollUp, Quit, SelectNext, SelectPrev, ShiftTab, SwitchFiles, SwitchGrep,
-    ToggleSelectAll, ToggleSelectedAndAdvance,
+    ToggleSelectAll, ToggleSelected,
 };
 use service::{
     CommandEnvelope, ForwardOutcome, ServiceCommand, forward_to_running_instance, start_listener,
@@ -174,14 +174,14 @@ fn bind_base_keys(cx: &mut App) {
         KeyBinding::new("return", OpenSelected, None),
         KeyBinding::new("up", SelectPrev, None),
         KeyBinding::new("down", SelectNext, None),
-        KeyBinding::new("tab", ToggleSelectedAndAdvance, None),
+        KeyBinding::new("tab", ToggleSelected, None),
         KeyBinding::new("ctrl-a", ToggleSelectAll, None),
         KeyBinding::new("shift-tab", ShiftTab, None),
         KeyBinding::new("ctrl-up", CyclePreviousQuery, None),
         KeyBinding::new("ctrl-u", PreviewScrollUp, None),
         KeyBinding::new("ctrl-d", PreviewScrollDown, None),
-        KeyBinding::new("ctrl-f", SwitchFiles, None),
-        KeyBinding::new("ctrl-g", SwitchGrep, None),
+        KeyBinding::new("cmd-f", SwitchFiles, None),
+        KeyBinding::new("cmd-g", SwitchGrep, None),
         KeyBinding::new("backspace", FieldBackspace, None),
         KeyBinding::new("delete", FieldDelete, None),
         KeyBinding::new("left", FieldLeft, None),
