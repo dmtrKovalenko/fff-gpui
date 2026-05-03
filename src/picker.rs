@@ -861,6 +861,28 @@ impl FffPicker {
         self.search_abort = None;
     }
 
+    // Clear results and repaint immediately, then kick off a fresh search on
+    // the next frame. This lets GPUI flush the mode-change render before the
+    // search work starts, avoiding a visible hang on the stale result list.
+    fn switch_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(abort) = &self.search_abort {
+            abort.store(true, Ordering::Release);
+        }
+        self.results.clear();
+        self.total_files = 0;
+        self.total_matched = 0;
+        self.selected = 0;
+        self.selected_paths.clear();
+        self.preview_lines.clear();
+        self.preview_loading = false;
+        self.preview_loading_visible = false;
+        self.status_message = None;
+        cx.notify();
+        cx.defer_in(window, |this, _window, cx| {
+            this.run_search(cx);
+        });
+    }
+
     // Load and syntax-highlight the selected file preview in the background.
     fn load_preview(&mut self, cx: &mut Context<Self>) {
         self.preview_epoch = self.preview_epoch.wrapping_add(1);
@@ -1183,7 +1205,7 @@ impl FffPicker {
     fn on_cycle_grep_mode(
         &mut self,
         _: &CycleGrepMode,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.grep_mode = match self.grep_mode {
@@ -1191,7 +1213,7 @@ impl FffPicker {
             GrepMode::Regex => GrepMode::Fuzzy,
             GrepMode::Fuzzy => GrepMode::PlainText,
         };
-        self.run_search(cx);
+        self.switch_mode(window, cx);
     }
 
     // Restore the previous query from the local search history.
@@ -1254,21 +1276,19 @@ impl FffPicker {
     }
 
     // Switch back to file search mode.
-    fn on_switch_files(&mut self, _: &SwitchFiles, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_switch_files(&mut self, _: &SwitchFiles, window: &mut Window, cx: &mut Context<Self>) {
         if self.view != SearchView::Files {
             self.view = SearchView::Files;
-            self.status_message = None;
-            self.run_search(cx);
+            self.switch_mode(window, cx);
         }
     }
 
     // Switch to live grep mode.
-    fn on_switch_grep(&mut self, _: &SwitchGrep, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_switch_grep(&mut self, _: &SwitchGrep, window: &mut Window, cx: &mut Context<Self>) {
         if self.view != SearchView::Grep {
             self.view = SearchView::Grep;
             self.grep_mode = GrepMode::PlainText;
-            self.status_message = None;
-            self.run_search(cx);
+            self.switch_mode(window, cx);
         }
     }
 
