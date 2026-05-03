@@ -43,6 +43,13 @@ fn syntax_set_for_path(path: &Path) -> Option<TreeSitterLanguageSpec> {
             injections_query: tree_sitter_rust::INJECTIONS_QUERY,
             locals_query: "",
         }),
+        "swift" => Some(TreeSitterLanguageSpec {
+            language: tree_sitter_swift::LANGUAGE.into(),
+            name: "swift",
+            highlights_query: tree_sitter_swift::HIGHLIGHTS_QUERY,
+            injections_query: tree_sitter_swift::INJECTIONS_QUERY,
+            locals_query: tree_sitter_swift::LOCALS_QUERY,
+        }),
         "js" | "mjs" | "cjs" | "jsx" => Some(TreeSitterLanguageSpec {
             language: tree_sitter_javascript::LANGUAGE.into(),
             name: "javascript",
