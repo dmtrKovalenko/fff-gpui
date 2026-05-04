@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use fff_query_parser::{FFFQuery, FileSearchConfig, FuzzyQuery, QueryParser};
 use fff_search::{
     ContentCacheBudget, FFFMode, FilePickerOptions, FuzzySearchOptions, GrepMode,
-    GrepSearchOptions, PaginationArgs, SharedFrecency, SharedPicker, SharedQueryTracker,
+    GrepSearchOptions, PaginationArgs, SharedFilePicker, SharedFrecency, SharedQueryTracker,
     file_picker::FilePicker, frecency::FrecencyTracker, git::format_git_status_opt,
     query_tracker::QueryTracker,
 };
@@ -87,7 +87,7 @@ enum SearchView {
 
 #[derive(Clone, Debug, Default)]
 pub struct PickerSharedState {
-    pub shared_picker: SharedPicker,
+    pub shared_picker: SharedFilePicker,
     pub shared_frecency: SharedFrecency,
     pub shared_query_tracker: SharedQueryTracker,
 }
@@ -120,7 +120,7 @@ pub struct FileItemSnapshot {
 }
 
 pub struct FffPicker {
-    shared_picker: SharedPicker,
+    shared_picker: SharedFilePicker,
     shared_frecency: SharedFrecency,
     shared_query_tracker: SharedQueryTracker,
     base_path: PathBuf,
@@ -130,6 +130,7 @@ pub struct FffPicker {
     results: Vec<FileItemSnapshot>,
     total_files: usize,
     total_matched: usize,
+    indexed_count: usize,
     selected: usize,
     selected_paths: BTreeSet<PathBuf>,
     scan_done: bool,
@@ -504,6 +505,7 @@ impl FffPicker {
             results: Vec::new(),
             total_files: 0,
             total_matched: 0,
+            indexed_count: 0,
             selected: 0,
             selected_paths: BTreeSet::new(),
             scan_done: false,
@@ -551,11 +553,14 @@ impl FffPicker {
         let sp = self.shared_picker.clone();
         let sf = self.shared_frecency.clone();
         let sq = self.shared_query_tracker.clone();
+
+        self.spawn_index_progress_poll(cx);
+
         let existing_picker = self.shared_picker.read().ok().and_then(|guard| {
             guard.as_ref().map(|picker| {
                 (
                     picker.base_path().to_path_buf(),
-                    picker.is_scanning.load(Ordering::Acquire),
+                    picker.get_scan_progress().is_scanning,
                 )
             })
         });
@@ -621,13 +626,12 @@ impl FffPicker {
                         let data_dir = PathBuf::from(home).join(".local/share/fff");
                         let _ = std::fs::create_dir_all(&data_dir);
                         if let Ok(tracker) =
-                            FrecencyTracker::new(data_dir.join("frecency.lmdb"), false)
+                            FrecencyTracker::open(data_dir.join("frecency.lmdb"))
                         {
                             let _ = sf.init(tracker);
                         }
-                        if let Ok(tracker) = QueryTracker::new(
+                        if let Ok(tracker) = QueryTracker::open(
                             data_dir.join("queries.lmdb").to_string_lossy().as_ref(),
-                            false,
                         ) {
                             let _ = sq.init(tracker);
                         }
@@ -682,6 +686,51 @@ impl FffPicker {
 
                 if let Err(err) = update_result {
                     warn!(error = %err, "failed to apply scan completion to picker state");
+                }
+            },
+        )
+        .detach();
+    }
+
+    // Poll the shared picker's scan progress at ~150 ms while scanning is
+    // active and publish `scanned_files_count` into `indexed_count` so the
+    // UI can render a live counter. The loop exits as soon as the scan
+    // reports `is_scanning == false`, or when the entity is dropped.
+    fn spawn_index_progress_poll(&self, cx: &mut Context<Self>) {
+        let shared_picker = self.shared_picker.clone();
+        cx.spawn(
+            async move |this: WeakEntity<FffPicker>, cx: &mut AsyncApp| {
+                loop {
+                    let Some(progress) = shared_picker
+                        .read()
+                        .ok()
+                        .and_then(|guard| guard.as_ref().map(|p| p.get_scan_progress()))
+                    else {
+                        smol::Timer::after(Duration::from_millis(150)).await;
+                        if this.upgrade().is_none() {
+                            return;
+                        }
+                        continue;
+                    };
+
+                    let count = progress.scanned_files_count;
+                    let scanning = progress.is_scanning;
+                    let update = this.update(cx, |this, cx| {
+                        if this.indexed_count != count {
+                            this.indexed_count = count;
+                            cx.notify();
+                        }
+                    });
+
+                    if update.is_err() {
+                        return;
+                    }
+
+                    if !scanning {
+                        return;
+                    }
+
+                    smol::Timer::after(Duration::from_millis(150)).await;
                 }
             },
         )
@@ -1320,6 +1369,7 @@ impl Render for FffPicker {
         let scan_done = self.scan_done;
         let total_files = self.total_files;
         let total_matched = self.total_matched;
+        let indexed_count = self.indexed_count;
         let selected_count = self.selected_paths.len();
         let selected_paths = self.selected_paths.clone();
         let list_scroll = self.list_scroll.clone();
@@ -1357,10 +1407,19 @@ impl Render for FffPicker {
         let mut status_text = if let Some(message) = self.status_message.clone() {
             message
         } else if !scan_done {
-            String::new()
+            if indexed_count > 0 {
+                format!("indexing. {indexed_count} files")
+            } else {
+                String::new()
+            }
         } else {
+            let indexed = if total_files > 0 {
+                total_files
+            } else {
+                indexed_count
+            };
             format!(
-                "{} shown  {selected_count} selected  {total_matched} matches  {total_files} indexed",
+                "{} shown  {selected_count} selected  {total_matched} matches  {indexed} indexed",
                 results.len()
             )
         };
@@ -1424,6 +1483,12 @@ impl Render for FffPicker {
                     .flex_col()
                     .overflow_hidden()
                     .when(!scan_done, |this| {
+                        let label = if indexed_count > 0 {
+                            format!("Indexing {indexed_count} files")
+                        } else {
+                            "Indexing".to_string()
+                        };
+
                         this.child(
                             div()
                                 .flex_1()
@@ -1433,7 +1498,7 @@ impl Render for FffPicker {
                                 .justify_center()
                                 .text_sm()
                                 .text_color(rgb(theme.text_dim))
-                                .child("Indexing\u{2026}"),
+                                .child(label),
                         )
                     })
                     .when(scan_done && results.is_empty(), |this| {

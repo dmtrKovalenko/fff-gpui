@@ -5,9 +5,9 @@ edition = "2024"
 
 [dependencies]
 gpui = { version = "*" }
-fff-search = { version = "0.6", features = ["zlob"] }
-fff-query-parser = { version = "0.6", features = ["zlob"] }
-fff-grep = { version = "0.6" }
+fff-search = { version = "0.7", features = ["zlob"] }
+fff-query-parser = { version = "0.7", features = ["zlob"] }
+fff-grep = { version = "0.7" }
 smol = "2"
 unicode-segmentation = "1"
 anyhow = "1"
